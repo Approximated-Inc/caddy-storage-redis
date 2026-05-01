@@ -23,9 +23,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// reconnectCount tracks how many times we've fallen back to a one-shot
-// client because the cached client was closed mid-operation. Exposed via
-// log lines and ReconnectCount() for ops visibility.
+// reconnectCount tracks how many one-shot reconnects we've performed because
+// the cached client was closed mid-operation. Package-level (rather than a
+// field on RedisStorage) because it must outlive any single instance: the
+// reconnects happen on orphaned storage structs that Caddy has already moved
+// past, while a fresh RedisStorage is provisioned for new traffic. The
+// counter belongs to the process so ops can see total churn.
 var reconnectCount atomic.Int64
 
 // ReconnectCount returns the number of one-shot reconnects that have
@@ -34,16 +37,18 @@ func ReconnectCount() int64 {
 	return reconnectCount.Load()
 }
 
-// errIsClientClosed reports whether err is the "redis: client is closed"
+// isClientClosedErr reports whether err is the "redis: client is closed"
 // failure that surfaces when this RedisStorage instance was Cleanup'd
 // (typically by a Caddy config reload) but a caller still holds a
 // reference to it for an in-flight operation — most often certmagic
 // during ACME HTTP-01 issuance.
 //
-// go-redis/v9 does not export the sentinel (it lives in the internal
-// pool package), so we string-match defensively. The error wording has
-// been stable across go-redis v8 and v9.
-func errIsClientClosed(err error) bool {
+// go-redis/v9 does export the sentinel as redis.ErrClosed, but the
+// helpers in this package wrap with fmt.Errorf("...: %v", err) (e.g.
+// storeDirectoryRecord) which strips the errors.Is chain, so we
+// substring-match instead. TestIsClientClosedErr pins the wording so a
+// future go-redis upgrade that changes it fails loudly.
+func isClientClosedErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "client is closed")
 }
 
@@ -53,23 +58,27 @@ func errIsClientClosed(err error) bool {
 // closes the one-shot via defer.
 //
 // The fresh client is intentionally NOT cached on rs. Caddy will not
-// call Cleanup again on this orphaned storage instance, so caching the
-// reopen would leak the client's reaper goroutine for the lifetime of
-// the process. Re-dialing per failed op trades a small handshake cost
-// (only paid on the rare orphan path) for zero leaked state.
+// call Cleanup again on this orphaned storage instance, and caching
+// would leak resources tied to the new client. The size of the leak
+// depends on the topology: for the failover (sentinel) client, a
+// background pubsub-listen goroutine survives until Close; the simple
+// and cluster clients hold a connection pool until Close. Re-dialing
+// per failed op trades a small handshake cost (only paid on the rare
+// orphan path) for zero leaked state across all topologies.
 //
-// Bounded to a single retry. If reconnect itself fails, the original
-// op error is returned wrapped together with the reconnect failure so
-// callers can see both.
+// Bounded to a single retry. If reconnect itself fails (e.g. Redis is
+// genuinely down), the reconnect error is wrapped with %w so callers
+// can errors.Is the original op error if needed; the reconnect failure
+// is included as %v for diagnostics.
 func (rs RedisStorage) withReconnectOnClosed(ctx context.Context, op func(redis.UniversalClient) error) error {
 	err := op(rs.client)
-	if !errIsClientClosed(err) {
+	if !isClientClosedErr(err) {
 		return err
 	}
 
 	fresh, ferr := rs.buildClient(ctx)
 	if ferr != nil {
-		return fmt.Errorf("redis storage: reconnect after closed client failed: %v (original op error: %v)", ferr, err)
+		return fmt.Errorf("redis storage: reconnect after closed client failed: %v (original op error: %w)", ferr, err)
 	}
 	defer fresh.Close()
 

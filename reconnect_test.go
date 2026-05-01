@@ -17,6 +17,7 @@ package storageredis
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"sync"
 	"testing"
@@ -32,9 +33,6 @@ import (
 // one-shot client is opened, the op succeeds, and the one-shot is closed.
 func TestReconnect_StoreAfterClose(t *testing.T) {
 	rs, ctx := provisionRedisStorage(t)
-	if rs == nil {
-		return // Redis unavailable; provision skips the test
-	}
 
 	// Establish baseline: storage works.
 	require.NoError(t, rs.Store(ctx, TestKeyExampleCrt, TestValueCrt))
@@ -57,7 +55,7 @@ func TestReconnect_StoreAfterClose(t *testing.T) {
 	// We did NOT swap rs.client; the cached client should still be closed.
 	// Re-pinging confirms we're not silently caching the one-shot.
 	pingErr := rs.client.Ping(ctx).Err()
-	assert.True(t, errIsClientClosed(pingErr),
+	assert.True(t, isClientClosedErr(pingErr),
 		"cached rs.client should remain closed; got %v", pingErr)
 
 	// Re-provision so subsequent assertions can read what we wrote.
@@ -75,9 +73,6 @@ func TestReconnect_StoreAfterClose(t *testing.T) {
 // client-closed error or a wrapped reconnect failure).
 func TestReconnect_LoadMissingAfterClose(t *testing.T) {
 	rs, ctx := provisionRedisStorage(t)
-	if rs == nil {
-		return
-	}
 
 	require.NoError(t, rs.client.Close())
 
@@ -90,9 +85,6 @@ func TestReconnect_LoadMissingAfterClose(t *testing.T) {
 // the helper-plumbed deleteDirectoryRecord call.
 func TestReconnect_DeleteAfterClose(t *testing.T) {
 	rs, ctx := provisionRedisStorage(t)
-	if rs == nil {
-		return
-	}
 
 	require.NoError(t, rs.Store(ctx, TestKeyExampleCrt, TestValueCrt))
 	require.NoError(t, rs.client.Close())
@@ -105,14 +97,14 @@ func TestReconnect_DeleteAfterClose(t *testing.T) {
 	assert.False(t, exists, "key should be gone after Delete via reconnect path")
 }
 
-// TestErrIsClientClosed pins the string-match sentinel so a future
+// TestIsClientClosedErr pins the string-match sentinel so a future
 // go-redis upgrade that changes the wording will fail loudly here.
-func TestErrIsClientClosed(t *testing.T) {
-	assert.True(t, errIsClientClosed(errors.New("redis: client is closed")))
-	assert.True(t, errIsClientClosed(errors.New("operation X failed: redis: client is closed")))
-	assert.False(t, errIsClientClosed(nil))
-	assert.False(t, errIsClientClosed(errors.New("redis: connection refused")))
-	assert.False(t, errIsClientClosed(errors.New("context canceled")))
+func TestIsClientClosedErr(t *testing.T) {
+	assert.True(t, isClientClosedErr(errors.New("redis: client is closed")))
+	assert.True(t, isClientClosedErr(errors.New("operation X failed: redis: client is closed")))
+	assert.False(t, isClientClosedErr(nil))
+	assert.False(t, isClientClosedErr(errors.New("redis: connection refused")))
+	assert.False(t, isClientClosedErr(errors.New("context canceled")))
 }
 
 // TestReconnect_ConcurrentStoresAfterClose stresses the reconnect path
@@ -122,9 +114,6 @@ func TestErrIsClientClosed(t *testing.T) {
 // must succeed and none should leak by panicking on closed pool state.
 func TestReconnect_ConcurrentStoresAfterClose(t *testing.T) {
 	rs, _ := provisionRedisStorage(t)
-	if rs == nil {
-		return
-	}
 
 	require.NoError(t, rs.client.Close())
 
@@ -135,7 +124,7 @@ func TestReconnect_ConcurrentStoresAfterClose(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			key := TestKeyExamplePath + "/concurrent-" + string(rune('a'+idx)) + ".bin"
+			key := fmt.Sprintf("%s/concurrent-%d.bin", TestKeyExamplePath, idx)
 			errs[idx] = rs.Store(context.Background(), key, TestValueCrt)
 		}(i)
 	}

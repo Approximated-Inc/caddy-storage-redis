@@ -576,6 +576,16 @@ func (rs RedisStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo,
 	}, nil
 }
 
+// Lock and Unlock are intentionally NOT wrapped with withReconnectOnClosed.
+// rs.locker wraps a redislock.Client around rs.client, so a one-shot retry
+// would also need a fresh redislock.Client and would not match the existing
+// rs.locks bookkeeping. The orphaned-storage case is recovered at a higher
+// level: when Caddy reloads, the new TLS app re-dispatches issuance via
+// ManageAsync against the freshly Provisioned RedisStorage, bypassing the
+// orphan entirely. (Note: certmagic's acquireLock does NOT itself retry on
+// storage errors, so the self-heal genuinely depends on Caddy's reload
+// re-dispatch — not a hidden certmagic retry.) If logs show recurring
+// redislock failures during reloads, revisit this and wrap both ops.
 func (rs *RedisStorage) Lock(ctx context.Context, name string) error {
 
 	key := rs.prefixLock(name)
@@ -653,6 +663,12 @@ func (rs *RedisStorage) Unlock(ctx context.Context, name string) error {
 	return nil
 }
 
+// Repair is intentionally NOT wrapped with withReconnectOnClosed. It's
+// admin-only (invoked via the `caddy storage-redis-repair` CLI), holds
+// rs.client across many Redis ops in a long loop, and isn't on certmagic's
+// cert-issuance path — so a Caddy reload during a Repair is rare enough
+// that the overhead of one-shot retries per op outweighs the benefit. If
+// Repair fails on a closed client, the operator can simply rerun it.
 func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 
 	var currKey = rs.prefixKey(dir)
