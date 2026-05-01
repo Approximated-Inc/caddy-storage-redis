@@ -24,6 +24,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 // reconnectCount tracks how many one-shot reconnects we've performed because
@@ -57,7 +58,7 @@ var reconnectMetric = prometheus.NewCounter(prometheus.CounterOpts{
 // context constructs a fresh registry, but we may also be called twice for
 // the same context if multiple RedisStorage instances are provisioned; the
 // AlreadyRegisteredError case is handled silently.
-func registerMetrics(ctx caddy.Context, logger interface{ Warnw(msg string, kvs ...interface{}) }) {
+func registerMetrics(ctx caddy.Context, logger *zap.SugaredLogger) {
 	reg := ctx.GetMetricsRegistry()
 	if reg == nil {
 		return
