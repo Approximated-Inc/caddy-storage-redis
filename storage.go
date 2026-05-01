@@ -229,8 +229,27 @@ func New() *RedisStorage {
 	return &rs
 }
 
-// Initialize Redis client and locker
+// Initialize Redis client and locker. The client and locker are stored on
+// rs for use by the public storage methods. buildClient does the actual
+// construction and is shared with withReconnectOnClosed.
 func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
+	client, err := rs.buildClient(ctx)
+	if err != nil {
+		return err
+	}
+	rs.client = client
+	rs.locker = redislock.New(rs.client)
+	rs.locks = &sync.Map{}
+	return nil
+}
+
+// buildClient constructs and pings a redis.UniversalClient from rs's
+// current configuration without mutating rs.client. Called by:
+//   - initRedisClient (assigns the result to rs.client during Provision)
+//   - withReconnectOnClosed (one-shot retry path for orphaned storage)
+//
+// Caller is responsible for closing the returned client.
+func (rs RedisStorage) buildClient(ctx context.Context) (redis.UniversalClient, error) {
 
 	// DB was validated in finalizeConfiguration; parse is safe here
 	dbInt, _ := strconv.Atoi(string(rs.DB))
@@ -266,7 +285,7 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 		}
 
 		if len(rs.TlsServerCertsPEM) > 0 && len(rs.TlsServerCertsPath) > 0 {
-			return fmt.Errorf("Cannot specify TlsServerCertsPEM alongside TlsServerCertsPath")
+			return nil, fmt.Errorf("Cannot specify TlsServerCertsPEM alongside TlsServerCertsPath")
 		}
 
 		if len(rs.TlsServerCertsPEM) > 0 || len(rs.TlsServerCertsPath) > 0 {
@@ -277,12 +296,12 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 				var err error
 				pem, err = os.ReadFile(rs.TlsServerCertsPath)
 				if err != nil {
-					return fmt.Errorf("Failed to load PEM server certs from file %s: %v", rs.TlsServerCertsPath, err)
+					return nil, fmt.Errorf("Failed to load PEM server certs from file %s: %v", rs.TlsServerCertsPath, err)
 				}
 			}
 
 			if !certPool.AppendCertsFromPEM(pem) {
-				return fmt.Errorf("Failed to load PEM server certs")
+				return nil, fmt.Errorf("Failed to load PEM server certs")
 			}
 
 			clientOpts.TLSConfig.RootCAs = certPool
@@ -291,7 +310,7 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 
 	// Create appropriate Redis client type
 	if rs.ClientType == "failover" && clientOpts.MasterName == "" {
-		return fmt.Errorf("'master_name' is required when using 'failover' client type")
+		return nil, fmt.Errorf("'master_name' is required when using 'failover' client type")
 	}
 
 	if rs.ClientType == "failover" {
@@ -308,9 +327,10 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 			return shard.Ping(ctx).Err()
 		})
 		if err != nil {
-			return err
+			clusterClient.Close()
+			return nil, err
 		}
-		rs.client = clusterClient
+		return clusterClient, nil
 
 	} else if rs.ClientType == "cluster" || len(clientOpts.Addrs) > 1 {
 
@@ -322,26 +342,21 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 			return shard.Ping(ctx).Err()
 		})
 		if err != nil {
-			return err
+			clusterClient.Close()
+			return nil, err
 		}
-		rs.client = clusterClient
-
-	} else {
-
-		// Create new Redis simple standalone client
-		rs.client = redis.NewClient(clientOpts.Simple())
-
-		// Test connection to the Redis server
-		err := rs.client.Ping(ctx).Err()
-		if err != nil {
-			return err
-		}
+		return clusterClient, nil
 	}
 
-	// Create new redislock client
-	rs.locker = redislock.New(rs.client)
-	rs.locks = &sync.Map{}
-	return nil
+	// Create new Redis simple standalone client
+	client := redis.NewClient(clientOpts.Simple())
+
+	// Test connection to the Redis server
+	if err := client.Ping(ctx).Err(); err != nil {
+		client.Close()
+		return nil, err
+	}
+	return client, nil
 }
 
 func (rs RedisStorage) Store(ctx context.Context, key string, value []byte) error {
@@ -391,46 +406,52 @@ func (rs RedisStorage) Store(ctx context.Context, key string, value []byte) erro
 	}
 
 	var prefixedKey = rs.prefixKey(key)
-
-	// Create directory structure set for current key
 	score := float64(sd.Modified.Unix())
-	if err := rs.storeDirectoryRecord(ctx, prefixedKey, score, false, false); err != nil {
-		return fmt.Errorf("Unable to create directory for key %s: %v", key, err)
-	}
 
-	// Store the key value in the Redis database
-	if err := rs.client.Set(ctx, prefixedKey, jsonValue, 0).Err(); err != nil {
-		return fmt.Errorf("Unable to set value for %s: %v", key, err)
-	}
+	return rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		// Create directory structure set for current key
+		if err := rs.storeDirectoryRecord(ctx, client, prefixedKey, score, false, false); err != nil {
+			return fmt.Errorf("Unable to create directory for key %s: %v", key, err)
+		}
 
-	return nil
+		// Store the key value in the Redis database
+		if err := client.Set(ctx, prefixedKey, jsonValue, 0).Err(); err != nil {
+			return fmt.Errorf("Unable to set value for %s: %v", key, err)
+		}
+
+		return nil
+	})
 }
 
 func (rs RedisStorage) Load(ctx context.Context, key string) ([]byte, error) {
 
 	var sd *StorageData
-	var value []byte
-	var err error
 
-	sd, err = rs.loadStorageData(ctx, key)
+	err := rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		var loadErr error
+		sd, loadErr = rs.loadStorageData(ctx, client, key)
+		return loadErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	value = sd.Value
+	value := sd.Value
 
 	// Decrypt value if encrypted
 	if sd.Encryption > 0 {
-		value, err = rs.decrypt(value)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to decrypt value for %s: %v", key, err)
+		var decErr error
+		value, decErr = rs.decrypt(value)
+		if decErr != nil {
+			return nil, fmt.Errorf("Unable to decrypt value for %s: %v", key, decErr)
 		}
 	}
 
 	// Decompress value if compressed
 	if sd.Compression > storageCompressionNone {
-		value, err = rs.decompress(value, sd.Compression)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to decompress value for %s: %v", key, err)
+		var decErr error
+		value, decErr = rs.decompress(value, sd.Compression)
+		if decErr != nil {
+			return nil, fmt.Errorf("Unable to decompress value for %s: %v", key, decErr)
 		}
 	}
 
@@ -441,20 +462,27 @@ func (rs RedisStorage) Delete(ctx context.Context, key string) error {
 
 	var prefixedKey = rs.prefixKey(key)
 
-	// Remove current key from directory structure
-	if err := rs.deleteDirectoryRecord(ctx, prefixedKey, false); err != nil {
-		return fmt.Errorf("Unable to delete directory for key %s: %v", key, err)
-	}
+	return rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		// Remove current key from directory structure
+		if err := rs.deleteDirectoryRecord(ctx, client, prefixedKey, false); err != nil {
+			return fmt.Errorf("Unable to delete directory for key %s: %v", key, err)
+		}
 
-	if err := rs.client.Del(ctx, prefixedKey).Err(); err != nil {
-		return fmt.Errorf("Unable to delete key %s: %v", key, err)
-	}
+		if err := client.Del(ctx, prefixedKey).Err(); err != nil {
+			return fmt.Errorf("Unable to delete key %s: %v", key, err)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 func (rs RedisStorage) Exists(ctx context.Context, key string) bool {
-	exists, err := rs.existsKey(ctx, key)
+	var exists bool
+	err := rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		var existsErr error
+		exists, existsErr = rs.existsKey(ctx, client, key)
+		return existsErr
+	})
 	if err != nil {
 		// CertMagic interface requires a boolean return only.
 		if rs.logger != nil {
@@ -465,17 +493,23 @@ func (rs RedisStorage) Exists(ctx context.Context, key string) bool {
 	return exists
 }
 
-func (rs RedisStorage) existsKey(ctx context.Context, key string) (bool, error) {
+// existsKey checks whether the user-facing key exists in Redis under
+// the configured key prefix. The client argument is the active client
+// (rs.client on the happy path, a one-shot during reconnect retries).
+func (rs RedisStorage) existsKey(ctx context.Context, client redis.UniversalClient, key string) (bool, error) {
 	// Redis returns a count of the number of keys found
-	exists, err := rs.existsRawKey(ctx, rs.prefixKey(key))
+	exists, err := rs.existsRawKey(ctx, client, rs.prefixKey(key))
 	if err != nil {
 		return false, fmt.Errorf("Unable to check existence for %s: %v", key, err)
 	}
 	return exists, nil
 }
 
-func (rs RedisStorage) existsRawKey(ctx context.Context, redisKey string) (bool, error) {
-	existsCount, err := rs.client.Exists(ctx, redisKey).Result()
+// existsRawKey checks whether a fully-qualified Redis key (no prefix
+// applied) currently exists. The client argument is threaded through so
+// a single op stays on one client (cached or one-shot).
+func (rs RedisStorage) existsRawKey(ctx context.Context, client redis.UniversalClient, redisKey string) (bool, error) {
+	existsCount, err := client.Exists(ctx, redisKey).Result()
 	if err != nil {
 		return false, err
 	}
@@ -487,10 +521,17 @@ func (rs RedisStorage) List(ctx context.Context, dir string, recursive bool) ([]
 	var keyList []string
 	var currKey = rs.prefixKey(dir)
 
-	// Obtain range of all direct children stored in the Sorted Set
-	keys, err := rs.client.ZRange(ctx, currKey, 0, -1).Result()
-	if err != nil {
-		return keyList, fmt.Errorf("Unable to get range on sorted set '%s': %v", currKey, err)
+	var keys []string
+	if err := rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		// Obtain range of all direct children stored in the Sorted Set
+		var rangeErr error
+		keys, rangeErr = client.ZRange(ctx, currKey, 0, -1).Result()
+		if rangeErr != nil {
+			return fmt.Errorf("Unable to get range on sorted set '%s': %v", currKey, rangeErr)
+		}
+		return nil
+	}); err != nil {
+		return keyList, err
 	}
 
 	// Iterate over each child key
@@ -517,7 +558,12 @@ func (rs RedisStorage) List(ctx context.Context, dir string, recursive bool) ([]
 
 func (rs RedisStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 
-	sd, err := rs.loadStorageData(ctx, key)
+	var sd *StorageData
+	err := rs.withReconnectOnClosed(ctx, func(client redis.UniversalClient) error {
+		var loadErr error
+		sd, loadErr = rs.loadStorageData(ctx, client, key)
+		return loadErr
+	})
 	if err != nil {
 		return certmagic.KeyInfo{}, err
 	}
@@ -634,7 +680,7 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 
 				// Load the Storage Data struct to obtain modified time
 				trimmedKey := rs.trimKey(key)
-				sd, err := rs.loadStorageData(ctx, trimmedKey)
+				sd, err := rs.loadStorageData(ctx, rs.client, trimmedKey)
 				if err != nil {
 					if rs.logger != nil {
 						rs.logger.Infof("Unable to load storage data for key '%s'", trimmedKey)
@@ -644,7 +690,7 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 
 				// Repair directory structure set for current key
 				score := float64(sd.Modified.Unix())
-				if err := rs.storeDirectoryRecord(ctx, key, score, true, false); err != nil {
+				if err := rs.storeDirectoryRecord(ctx, rs.client, key, score, true, false); err != nil {
 					return fmt.Errorf("Unable to repair directory index for key '%s'", trimmedKey)
 				}
 			}
@@ -672,7 +718,7 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 		fullPathKey := path.Join(dir, trimmedKey)
 
 		// Remove key from set if it does not exist
-		exists, err := rs.existsKey(ctx, fullPathKey)
+		exists, err := rs.existsKey(ctx, rs.client, fullPathKey)
 		if err != nil {
 			return err
 		}
@@ -710,9 +756,13 @@ func (rs *RedisStorage) prefixLock(key string) string {
 	return rs.prefixKey(path.Join("locks", key))
 }
 
-func (rs RedisStorage) loadStorageData(ctx context.Context, key string) (*StorageData, error) {
+// loadStorageData reads and JSON-decodes the StorageData blob for key.
+// The client argument is the active client (rs.client on the happy path,
+// a one-shot during reconnect retries) so callers can route through
+// withReconnectOnClosed.
+func (rs RedisStorage) loadStorageData(ctx context.Context, client redis.UniversalClient, key string) (*StorageData, error) {
 
-	data, err := rs.client.Get(ctx, rs.prefixKey(key)).Bytes()
+	data, err := client.Get(ctx, rs.prefixKey(key)).Bytes()
 	if data == nil || errors.Is(err, redis.Nil) {
 		return nil, fs.ErrNotExist
 	} else if err != nil {
@@ -727,8 +777,10 @@ func (rs RedisStorage) loadStorageData(ctx context.Context, key string) (*Storag
 	return sd, nil
 }
 
-// Store directory index in Redis ZSet structure for fast and efficient traversal in List()
-func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, score float64, repair, baseIsDir bool) error {
+// Store directory index in Redis ZSet structure for fast and efficient traversal in List().
+// Recurses against the same client argument so a single op stays on one client (cached or
+// one-shot) for its full lifetime — important during the reconnect retry path.
+func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, client redis.UniversalClient, key string, score float64, repair, baseIsDir bool) error {
 
 	// Extract parent directory and base (file) names from key
 	dir, base := rs.splitDirectoryKey(key, baseIsDir)
@@ -738,7 +790,7 @@ func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, sco
 	}
 
 	// Insert "base" value into Set "dir"
-	success, err := rs.client.ZAdd(ctx, dir, redis.Z{Score: score, Member: base}).Result()
+	success, err := client.ZAdd(ctx, dir, redis.Z{Score: score, Member: base}).Result()
 	if err != nil {
 		return fmt.Errorf("Unable to add %s to Set %s: %v", base, dir, err)
 	}
@@ -752,7 +804,7 @@ func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, sco
 		}
 		// recursively create parent directory until already
 		// created (success == 0) or top level reached
-		if err := rs.storeDirectoryRecord(ctx, dir, score, repair, true); err != nil {
+		if err := rs.storeDirectoryRecord(ctx, client, dir, score, repair, true); err != nil {
 			return err
 		}
 	}
@@ -760,8 +812,10 @@ func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, sco
 	return nil
 }
 
-// Delete record from directory index Redis ZSet structure
-func (rs RedisStorage) deleteDirectoryRecord(ctx context.Context, key string, baseIsDir bool) error {
+// Delete record from directory index Redis ZSet structure.
+// The client argument is threaded through recursive calls and the
+// existence check so a single op stays on one client (cached or one-shot).
+func (rs RedisStorage) deleteDirectoryRecord(ctx context.Context, client redis.UniversalClient, key string, baseIsDir bool) error {
 
 	dir, base := rs.splitDirectoryKey(key, baseIsDir)
 	// Reached the top-level directory
@@ -770,19 +824,19 @@ func (rs RedisStorage) deleteDirectoryRecord(ctx context.Context, key string, ba
 	}
 
 	// Remove "base" value from Set "dir"
-	if err := rs.client.ZRem(ctx, dir, base).Err(); err != nil {
+	if err := client.ZRem(ctx, dir, base).Err(); err != nil {
 		return fmt.Errorf("Unable to remove %s from Set %s: %v", base, dir, err)
 	}
 
 	// Check if Set "dir" still exists (removing the last item deletes the set)
-	exists, err := rs.existsRawKey(ctx, dir)
+	exists, err := rs.existsRawKey(ctx, client, dir)
 	if err != nil {
 		return fmt.Errorf("Unable to check existence for %s: %v", dir, err)
 	}
 	if !exists {
 		// Recursively delete parent directory until parent
 		// is not empty (exists > 0) or top level reached
-		if err := rs.deleteDirectoryRecord(ctx, dir, true); err != nil {
+		if err := rs.deleteDirectoryRecord(ctx, client, dir, true); err != nil {
 			return err
 		}
 	}
