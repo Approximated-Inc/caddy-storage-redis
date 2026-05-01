@@ -189,6 +189,12 @@ func (rs *RedisStorage) Provision(ctx caddy.Context) error {
 
 	rs.logger = ctx.Logger().Sugar()
 
+	// Register process-wide reconnect counter with this context's
+	// Prometheus registry. Idempotent across reloads / multiple
+	// RedisStorage instances per context (AlreadyRegisteredError is
+	// handled silently inside).
+	registerMetrics(ctx, rs.logger)
+
 	// Abstract this logic for testing purposes
 	err := rs.finalizeConfiguration(ctx)
 	if err == nil {
