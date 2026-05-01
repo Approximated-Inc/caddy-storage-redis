@@ -22,9 +22,20 @@ import (
 	"sync"
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// reconnectMetricValue returns the current value of the reconnects_total
+// Prometheus counter so tests can assert on its movement alongside the
+// atomic counter.
+func reconnectMetricValue(t *testing.T) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, reconnectMetric.Write(&m))
+	return m.GetCounter().GetValue()
+}
 
 // TestReconnect_StoreAfterClose simulates a Caddy reload that has Cleanup'd
 // the storage instance while a caller (e.g. certmagic mid-issuance) still
@@ -42,6 +53,7 @@ func TestReconnect_StoreAfterClose(t *testing.T) {
 	require.NoError(t, rs.client.Close())
 
 	startReconnects := ReconnectCount()
+	startMetric := reconnectMetricValue(t)
 
 	// This Store should detect the closed client, open a one-shot,
 	// succeed, and close the one-shot. No panic, no permanent failure.
@@ -51,6 +63,9 @@ func TestReconnect_StoreAfterClose(t *testing.T) {
 	// The reconnect counter should have advanced by exactly one.
 	assert.Equal(t, startReconnects+1, ReconnectCount(),
 		"each closed-client retry should bump the reconnect counter once")
+	// The Prometheus metric should mirror the atomic counter.
+	assert.Equal(t, startMetric+1, reconnectMetricValue(t),
+		"reconnects_total Prometheus counter should advance with each retry")
 
 	// We did NOT swap rs.client; the cached client should still be closed.
 	// Re-pinging confirms we're not silently caching the one-shot.
@@ -133,4 +148,59 @@ func TestReconnect_ConcurrentStoresAfterClose(t *testing.T) {
 	for i, err := range errs {
 		assert.NoError(t, err, "goroutine %d should have stored successfully via reconnect", i)
 	}
+}
+
+// TestReconnect_LockAfterClose: Lock obtained against an already-closed
+// cached client must succeed via a one-shot redislock.Client built around
+// a fresh redis.UniversalClient. Unlock must Release cleanly via the
+// fresh client and close it.
+func TestReconnect_LockAfterClose(t *testing.T) {
+	rs, ctx := provisionRedisStorage(t)
+
+	// Simulate Caddy Cleanup BEFORE the lock is acquired. The orphaned
+	// RedisStorage's cached client is dead; the fresh-client retry path
+	// inside Lock should kick in.
+	require.NoError(t, rs.client.Close())
+
+	startReconnects := ReconnectCount()
+
+	require.NoError(t, rs.Lock(ctx, TestKeyLock), "Lock should retry against a fresh client")
+
+	assert.Equal(t, startReconnects+1, ReconnectCount(),
+		"Lock retry should bump the reconnect counter")
+
+	// Cached client should still be closed; we did not swap it.
+	assert.True(t, isClientClosedErr(rs.client.Ping(ctx).Err()),
+		"cached rs.client should remain closed after Lock retry")
+
+	// Unlock should succeed via the per-lock fresh client; it should
+	// also close that fresh client (verified indirectly: no goroutine
+	// or connection leak; correctness asserted by Release returning nil).
+	require.NoError(t, rs.Unlock(ctx, TestKeyLock), "Unlock should succeed via per-lock fresh client")
+
+	// After Unlock, the lock should be releasable from a re-provisioned
+	// storage instance — i.e. it's actually gone from Redis, not just
+	// dropped from our local map.
+	require.NoError(t, rs.finalizeConfiguration(ctx))
+	require.NoError(t, rs.Lock(ctx, TestKeyLock), "second Lock on same key after Unlock should succeed")
+	require.NoError(t, rs.Unlock(ctx, TestKeyLock))
+}
+
+// TestReconnect_UnlockAfterMidFlightClose: Lock is obtained while the
+// cached client is alive, THEN Caddy Cleanup'd it (closed the client)
+// before Unlock fires. Unlock can't Release against the closed client
+// but must still clean up local state without erroring (the lock will
+// TTL out within lockTTL).
+func TestReconnect_UnlockAfterMidFlightClose(t *testing.T) {
+	rs, ctx := provisionRedisStorage(t)
+
+	require.NoError(t, rs.Lock(ctx, TestKeyLock), "initial Lock should succeed against cached client")
+
+	// Now simulate Caddy Cleanup mid-critical-section.
+	require.NoError(t, rs.client.Close())
+
+	// Unlock should not propagate the closed-client error — the lock will
+	// TTL out, and certmagic doesn't surface Unlock errors as fatal.
+	require.NoError(t, rs.Unlock(ctx, TestKeyLock),
+		"Unlock should swallow closed-client error and return nil")
 }

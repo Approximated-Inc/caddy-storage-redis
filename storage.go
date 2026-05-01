@@ -196,6 +196,14 @@ func (d *DBIndex) UnmarshalJSON(data []byte) error {
 type heldLock struct {
 	lock   *redislock.Lock
 	cancel context.CancelFunc
+
+	// freshClient is non-nil when Lock retried against a one-shot
+	// redis.UniversalClient (because the cached client had been closed
+	// by a Caddy reload). The refresh goroutine and Unlock both go
+	// through `lock`, which references the fresh redislock.Client
+	// constructed around freshClient — so they stay consistent for the
+	// lifetime of the lock. Unlock closes freshClient on release.
+	freshClient redis.UniversalClient
 }
 
 // StorageData compression flag values stored per value in Redis.
@@ -576,31 +584,32 @@ func (rs RedisStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo,
 	}, nil
 }
 
-// Lock and Unlock are intentionally NOT wrapped with withReconnectOnClosed.
-// rs.locker wraps a redislock.Client around rs.client, so a one-shot retry
-// would also need a fresh redislock.Client and would not match the existing
-// rs.locks bookkeeping. The orphaned-storage case is recovered at a higher
-// level: when Caddy reloads, the new TLS app re-dispatches issuance via
-// ManageAsync against the freshly Provisioned RedisStorage, bypassing the
-// orphan entirely. (Note: certmagic's acquireLock does NOT itself retry on
-// storage errors, so the self-heal genuinely depends on Caddy's reload
-// re-dispatch — not a hidden certmagic retry.) If logs show recurring
-// redislock failures during reloads, revisit this and wrap both ops.
+// Lock obtains a distributed lock via redislock. If the cached client was
+// closed by a Caddy reload (orphaned-storage path), Obtain is retried
+// against a one-shot redis.UniversalClient + fresh redislock.Client, both
+// stored on the heldLock so the refresh goroutine and Unlock stay
+// consistent for the lock's lifetime. Unlock closes the one-shot.
+//
+// The fresh client survives further Caddy reloads — Cleanup only closes
+// rs.client, not the per-lock one-shot — so a single in-flight cert
+// obtain whose Lock landed in the orphan window can complete cleanly
+// without depending on Caddy's higher-level ManageAsync re-dispatch.
 func (rs *RedisStorage) Lock(ctx context.Context, name string) error {
 
 	key := rs.prefixLock(name)
 
 	for {
-		// try to obtain lock
-		lock, err := rs.locker.Obtain(ctx, key, lockTTL, &redislock.Options{})
+		// try to obtain lock; reconnect-and-retry once if cached client closed
+		lock, freshClient, err := rs.tryObtainLock(ctx, key)
 
 		// lock successfully obtained
 		if err == nil {
 			refreshCtx, cancel := context.WithCancel(context.Background())
 			// store lock handle + refresh cancel function for Unlock()
 			rs.locks.Store(key, heldLock{
-				lock:   lock,
-				cancel: cancel,
+				lock:        lock,
+				cancel:      cancel,
+				freshClient: freshClient,
 			})
 			// keep the lock fresh until Unlock() cancels refreshCtx
 			go func(ctx context.Context, lock *redislock.Lock) {
@@ -650,6 +659,45 @@ func (rs *RedisStorage) Lock(ctx context.Context, name string) error {
 	}
 }
 
+// tryObtainLock attempts to obtain the lock against the cached locker;
+// on a closed-client error it builds a one-shot redis.UniversalClient
+// + fresh redislock.Client and retries once. The returned freshClient
+// is non-nil only when the retry path was taken, and ownership transfers
+// to the caller (which stores it on the heldLock for Unlock to close).
+//
+// Bounded to a single retry. If the reconnect itself fails, the original
+// error is returned wrapped via %w so callers can errors.Is the
+// underlying redis.ErrClosed if needed.
+func (rs *RedisStorage) tryObtainLock(ctx context.Context, key string) (*redislock.Lock, redis.UniversalClient, error) {
+	lock, err := rs.locker.Obtain(ctx, key, lockTTL, &redislock.Options{})
+	if err == nil {
+		return lock, nil, nil
+	}
+	if !isClientClosedErr(err) {
+		return nil, nil, err
+	}
+
+	fresh, ferr := rs.buildClient(ctx)
+	if ferr != nil {
+		return nil, nil, fmt.Errorf("redis storage: lock reconnect failed: %v (original op error: %w)", ferr, err)
+	}
+
+	n := reconnectCount.Add(1)
+	reconnectMetric.Inc()
+	if rs.logger != nil {
+		rs.logger.Warnw("redis storage one-shot reconnect for Lock (orphaned by Caddy reload)",
+			"key", key, "total_reconnects_since_start", n)
+	}
+
+	freshLocker := redislock.New(fresh)
+	lock, err = freshLocker.Obtain(ctx, key, lockTTL, &redislock.Options{})
+	if err != nil {
+		fresh.Close()
+		return nil, nil, err
+	}
+	return lock, fresh, nil
+}
+
 func (rs *RedisStorage) Unlock(ctx context.Context, name string) error {
 
 	key := rs.prefixLock(name)
@@ -658,12 +706,34 @@ func (rs *RedisStorage) Unlock(ctx context.Context, name string) error {
 	if syncMapLock, loaded := rs.locks.LoadAndDelete(key); loaded {
 
 		// type assertion for held lock
-		if lock, ok := syncMapLock.(heldLock); ok {
-			lock.cancel()
+		if held, ok := syncMapLock.(heldLock); ok {
+			// Cancel the refresh goroutine first so it stops looping
+			// even if Release fails on a closed client.
+			held.cancel()
 
-			// release the Redis lock
-			if err := lock.lock.Release(ctx); err != nil {
-				return fmt.Errorf("Unable to release lock for %s: %v", key, err)
+			releaseErr := held.lock.Release(ctx)
+
+			// Always close the per-lock one-shot client, if any, so we
+			// don't leak it regardless of Release's outcome.
+			if held.freshClient != nil {
+				held.freshClient.Close()
+			}
+
+			if releaseErr != nil {
+				if isClientClosedErr(releaseErr) {
+					// Cached client was closed mid-flight (Caddy reload
+					// after Lock obtained against rs.client). The lock
+					// will TTL out within lockTTL — we can't release it
+					// explicitly without rebuilding redislock state from
+					// the lock's Token. certmagic doesn't surface Unlock
+					// errors as fatal anyway; downgrade to debug.
+					if rs.logger != nil {
+						rs.logger.Debugw("Unlock skipped Release on closed client; lock will TTL out",
+							"key", key, "ttl", lockTTL)
+					}
+					return nil
+				}
+				return fmt.Errorf("Unable to release lock for %s: %v", key, releaseErr)
 			}
 		}
 	}

@@ -16,10 +16,13 @@ package storageredis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
 
+	"github.com/caddyserver/caddy/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -35,6 +38,39 @@ var reconnectCount atomic.Int64
 // occurred since the process started. Useful for metrics or smoke tests.
 func ReconnectCount() int64 {
 	return reconnectCount.Load()
+}
+
+// reconnectMetric is a process-wide Prometheus counter that mirrors
+// reconnectCount and is registered with each Caddy context's metrics
+// registry on Provision. Same instance across reloads — incrementing it
+// from an orphaned RedisStorage updates the counter that the most-recent
+// context's /metrics endpoint exposes.
+var reconnectMetric = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "caddy",
+	Subsystem: "storage_redis",
+	Name:      "reconnects_total",
+	Help:      "Total number of one-shot Redis reconnects performed by the storage module after the cached client was closed (typically by a Caddy config reload mid-issuance).",
+})
+
+// registerMetrics attempts to register reconnectMetric with the per-context
+// Caddy metrics registry. Safe to call from every Provision: each Caddy
+// context constructs a fresh registry, but we may also be called twice for
+// the same context if multiple RedisStorage instances are provisioned; the
+// AlreadyRegisteredError case is handled silently.
+func registerMetrics(ctx caddy.Context, logger interface{ Warnw(msg string, kvs ...interface{}) }) {
+	reg := ctx.GetMetricsRegistry()
+	if reg == nil {
+		return
+	}
+	if err := reg.Register(reconnectMetric); err != nil {
+		var alreadyReg prometheus.AlreadyRegisteredError
+		if errors.As(err, &alreadyReg) {
+			return
+		}
+		if logger != nil {
+			logger.Warnw("redis storage: failed to register reconnect metric", "error", err)
+		}
+	}
 }
 
 // isClientClosedErr reports whether err is the "redis: client is closed"
@@ -83,6 +119,7 @@ func (rs RedisStorage) withReconnectOnClosed(ctx context.Context, op func(redis.
 	defer fresh.Close()
 
 	n := reconnectCount.Add(1)
+	reconnectMetric.Inc()
 	if rs.logger != nil {
 		rs.logger.Warnw("redis storage one-shot reconnect (orphaned by Caddy reload)",
 			"total_reconnects_since_start", n)
