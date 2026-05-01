@@ -5,9 +5,23 @@ This is comprehensive rewrite of the [gamalan/caddy-tlsredis](https://github.com
 * Fixes some logic issues with configuration parsing
 * Introduces a new storage compression option
 * Features a Sorted Set indexing algorithm for more efficient directory traversal
-* Implements support for Redis Cluster and Sentinal / Failover servers
+* Implements support for Redis Cluster and Sentinel / Failover servers
 
 The plugin uses the latest version of the [go-redis/redis](https://github.com/go-redis/redis) client and [redislock](https://github.com/bsm/redislock) for the locking mechanism. See [distlock](https://redis.io/topics/distlock) for more information on the lock algorithm.
+
+## Build Instructions
+
+To build this module with Caddy Server v2.10.2 and older you must use the v1.5.x release:
+
+```
+xcaddy build v2.10.2 --with github.com/pberkel/caddy-storage-redis@v1.5.0
+```
+
+Caddy Server v2.11.1 and newer can be built with the latest version of this module:
+
+```
+xcaddy build --with github.com/pberkel/caddy-storage-redis
+```
 
 ## Upgrading
 
@@ -15,7 +29,7 @@ Previous configuration options from [gamalan/caddy-tlsredis](https://github.com/
 - `CADDY_CLUSTERING_REDIS_*` environment variables have been removed. See the  below configuration example to configure this module using environment variables.
 - When using the JSON config format directly, be aware of these differences between the old plugin and this plugin:
   - The `address`, `host`, and `port` config fields are now arrays of strings to allow for clustering. The old format was only a string.
-  - The old plugin had a config field for `value_prefix`, which has been depricated and is not included in this plugin.
+  - The old plugin had a config field for `value_prefix`, which has been deprecated and is not included in this plugin.
   - The config field `aes_key` is now named `encryption_key`.
   - The `timeout` config field used to accept only an integer however now accepts only a string.
 
@@ -37,11 +51,11 @@ Enable Redis storage for Caddy by specifying the module configuration in the Cad
         password       ""
         db             0
         timeout        5
-        key_prefix     "caddy"
-        encryption_key ""    // default no encryption; enable by specifying a secret key containing 32 characters (longer keys will be truncated)
-        compression    false // default no compression; if set to true, stored values are compressed using "compress/flate"
+        key_prefix     "caddy" // should not contain any leading or trailing '/' characters nor '.' or '..' path segments
+        encryption_key ""      // default no encryption; enable by specifying a secret key containing 32 characters (longer keys will be truncated)
+        compression    false   // compression algorithm: 'flate' (raw DEFLATE), 'zlib', or 'false' (no compression, the default). Legacy boolean 'true' maps to 'flate'
         tls_enabled    false
-        tls_insecure   true
+        tls_insecure   false
     }
 }
 
@@ -76,7 +90,7 @@ Here's the same config as above, but in JSON format (which Caddy parses all conf
         "route_randomly": false,
         "timeout": "5",
         "tls_enabled": false,
-        "tls_insecure": true,
+        "tls_insecure": false,
         "tls_server_certs_path": "",
         "tls_server_certs_pem": "",
         "username": ""
@@ -101,16 +115,15 @@ The module supports [environment variable substitution](https://caddyserver.com/
     storage redis {
         username       "{$REDIS_USERNAME}"
         password       "{$REDIS_PASSWORD}"
+        db             "{$REDIS_DB}"
         encryption_key "{$REDIS_ENCRYPTION_KEY}"
-        compression    true
+        compression    "{$REDIS_COMPRESSION}"
     }
 }
 ```
 
-NOTE however the following configuration options do not (yet) support runtime substition:
+NOTE however the following configuration options do not (yet) support runtime substitution:
 
-- db
-- compression
 - tls_enabled
 - tls_insecure
 - route_by_latency
@@ -157,9 +170,9 @@ Parameters `address`, `host`, and `port` all accept either single or multiple in
 ```
 Two optional boolean cluster parameters `route_by_latency` and `route_randomly` are supported.  Either option can be enabled by setting the value to `true` (Default is false)
 
-### Failover mode (Sentinal)
+### Failover mode (Sentinel)
 
-Connecting to Redis servers managed by Sentinal requires both the `failover` flag and `master_name` value to be set:
+Connecting to Redis servers managed by Sentinel requires both the `failover` flag and `master_name` value to be set:
 ```
 {
     storage redis failover {
@@ -178,14 +191,14 @@ Optionally, if your Sentinel servers require authentication, you can specify the
 
 ### Enabling TLS
 
-TLS is disabled by default, and if enabled, accepts any server certificate by default. If TLS is and certificate verification are enabled as in the following example, then the system trust store will be used to validate the server certificate.
+TLS connections to the Redis server is disabled by default. Since v1.7 certificate verification is enabled by default and will use the system trust store to validate the Redis server certificate (Prior to v1.7 certificate verification was disabled by default).  For instances where TLS is required but the Redis server does not have a verifiable certificate, use the following configuration:
 ```
 {
     storage redis {
         host 127.0.0.01
         port 6379
         tls_enabled true
-        tls_insecure false
+        tls_insecure true
     }
 }
 ```

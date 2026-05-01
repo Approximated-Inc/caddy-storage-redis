@@ -1,3 +1,17 @@
+// Copyright 2024 Pieter Berkel
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package storageredis
 
 import (
@@ -32,25 +46,19 @@ const (
 	defaultPort = "6379"
 
 	// Redis server database
-	defaultDb = 0
+	defaultDb = "0"
 
 	// Prepended to every Redis key
 	defaultKeyPrefix = "caddy"
 
-	// Compress values before storing
-	defaultCompression = false
+	// Separator for Redis key path segments
+	keyPathSeparator = "/"
 
 	// Connect to Redis via TLS
 	defaultTLS = false
 
-	// Do not verify TLS cerficate
-	defaultTLSInsecure = true
-
-	// Routing option for cluster client
-	defaultRouteByLatency = false
-
-	// Routing option for cluster client
-	defaultRouteRandomly = false
+	// Always verify TLS cerficate
+	defaultTLSInsecure = false
 
 	// Redis lock time-to-live
 	lockTTL = 5 * time.Second
@@ -63,42 +71,44 @@ const (
 )
 
 // RedisStorage implements a Caddy storage backend for Redis
-// It supports Single (Standalone), Cluster, or Sentinal (Failover) Redis server configurations.
+// It supports Single (Standalone), Cluster, or Sentinel (Failover) Redis server configurations.
 type RedisStorage struct {
 	// ClientType specifies the Redis client type. Valid values are "cluster" or "failover"
-	ClientType    string   `json:"client_type"`
+	ClientType string `json:"client_type"`
 	// Address The full address of the Redis server. Example: "127.0.0.1:6379"
 	// If not defined, will be generated from Host and Port parameters.
-	Address       []string `json:"address"`
+	Address []string `json:"address"`
 	// Host The Redis server hostname or IP address. Default: "127.0.0.1"
-	Host          []string `json:"host"`
+	Host []string `json:"host"`
 	// Host The Redis server port number. Default: "6379"
-	Port          []string `json:"port"`
-	// DB The Redis server database number. Default: 0
-	DB            int      `json:"db"`
+	Port []string `json:"port"`
+	// DB The Redis server database number. Default: 0. Supports Caddy placeholder substitution.
+	DB DBIndex `json:"db"`
 	// Timeout The Redis server timeout in seconds. Default: 5
-	Timeout       string   `json:"timeout"`
+	Timeout string `json:"timeout"`
 	// Username The username for authenticating with the Redis server. Default: "" (No authentication)
-	Username      string   `json:"username"`
+	Username string `json:"username"`
 	// Password The password for authenticating with the Redis server. Default: "" (No authentication)
-	Password      string   `json:"password"`
+	Password string `json:"password"`
 	// SentinelPassword Optional The Redis sentinel password if authentication is enabled.
 	SentinelPassword string `json:"sentinel_password"`
-	// MasterName Only required when connecting to Redis via Sentinal (Failover mode). Default ""
-	MasterName    string   `json:"master_name"`
+	// MasterName Only required when connecting to Redis via Sentinel (Failover mode). Default ""
+	MasterName string `json:"master_name"`
 	// KeyPrefix A string prefix that is appended to Redis keys. Default: "caddy"
 	// Useful when the Redis server is used by multiple applications.
-	KeyPrefix     string   `json:"key_prefix"`
+	KeyPrefix string `json:"key_prefix"`
 	// EncryptionKey A key string used to symmetrically encrypt and decrypt data stored in Redis.
 	// The key must be exactly 32 characters, longer values will be truncated. Default: "" (No encryption)
-	EncryptionKey string   `json:"encryption_key"`
-	// Compression Specifies whether values should be compressed before storing in Redis. Default: false
-	Compression   bool     `json:"compression"`
+	EncryptionKey string `json:"encryption_key"`
+	// Compression Specifies the compression algorithm to use when storing values in Redis.
+	// Valid values are "flate", "zlib", or "false" (no compression). Default: "" (no compression)
+	// Supports Caddy placeholders (e.g. {env.COMPRESSION}).
+	Compression CompressionMode `json:"compression"`
 	// TlsEnabled controls whether TLS will be used to connect to the Redis
 	// server. False by default.
 	TlsEnabled bool `json:"tls_enabled"`
 	// TlsInsecure controls whether the client will verify the server
-	// certificate. See `InsecureSkipVerify` in `tls.Config` for details. True
+	// certificate. See `InsecureSkipVerify` in `tls.Config` for details. False
 	// by default.
 	// https://pkg.go.dev/crypto/tls#Config
 	TlsInsecure bool `json:"tls_insecure"`
@@ -116,15 +126,84 @@ type RedisStorage struct {
 	// https://pkg.go.dev/crypto/x509#CertPool.AppendCertsFromPEM
 	TlsServerCertsPath string `json:"tls_server_certs_path"`
 	// RouteByLatency Route commands by latency, only used in Cluster mode. Default: false
-	RouteByLatency     bool   `json:"route_by_latency"`
+	RouteByLatency bool `json:"route_by_latency"`
 	// RouteRandomly Route commands randomly, only used in Cluster mode. Default: false
-	RouteRandomly      bool   `json:"route_randomly"`
+	RouteRandomly bool `json:"route_randomly"`
 
 	client redis.UniversalClient
 	locker *redislock.Client
 	logger *zap.SugaredLogger
 	locks  *sync.Map
 }
+
+// CompressionMode specifies the compression algorithm used when storing values.
+// Accepts both the legacy boolean form (true=flate, false=none) and string form in JSON,
+// allowing runtime placeholder substitution via Caddy's replacer (e.g. {env.COMPRESSION}).
+type CompressionMode string
+
+const (
+	CompressionNone  CompressionMode = ""
+	CompressionFlate CompressionMode = "flate"
+	CompressionZlib  CompressionMode = "zlib"
+)
+
+// UnmarshalJSON accepts both the legacy boolean form used before v1.7.1
+// ("compression": true/false) and the new string form ("compression": "flate"/"zlib"/"false"),
+// preserving backwards compatibility with existing JSON configurations.
+func (c *CompressionMode) UnmarshalJSON(data []byte) error {
+	// Try bool first to handle legacy configs: true → "flate", false → ""
+	var b bool
+	if json.Unmarshal(data, &b) == nil {
+		if b {
+			*c = CompressionFlate
+		} else {
+			*c = CompressionNone
+		}
+		return nil
+	}
+	// Fall through to string form for new configs and placeholder-resolved values
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*c = CompressionMode(s)
+	return nil
+}
+
+// DBIndex holds a Redis database index. It accepts both integer (legacy JSON form)
+// and string (new JSON form) during unmarshalling, enabling runtime placeholder
+// substitution via Caddy's replacer (e.g. {env.REDIS_DB}).
+type DBIndex string
+
+// UnmarshalJSON accepts both the legacy integer form used in earlier configs
+// ("db": 0) and the new string form ("db": "0"), preserving backwards compatibility.
+func (d *DBIndex) UnmarshalJSON(data []byte) error {
+	// Try int first to handle legacy JSON configs
+	var n int
+	if json.Unmarshal(data, &n) == nil {
+		*d = DBIndex(strconv.Itoa(n))
+		return nil
+	}
+	// Fall through to string form for new configs and placeholder-resolved values
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*d = DBIndex(s)
+	return nil
+}
+
+type heldLock struct {
+	lock   *redislock.Lock
+	cancel context.CancelFunc
+}
+
+// StorageData compression flag values stored per value in Redis.
+const (
+	storageCompressionNone  = 0
+	storageCompressionFlate = 1
+	storageCompressionZlib  = 2
+)
 
 type StorageData struct {
 	Value       []byte    `json:"value"`
@@ -141,17 +220,20 @@ func New() *RedisStorage {
 		ClientType:  defaultClientType,
 		Host:        []string{defaultHost},
 		Port:        []string{defaultPort},
-		DB:          defaultDb,
+		DB:          DBIndex(defaultDb),
 		KeyPrefix:   defaultKeyPrefix,
-		Compression: defaultCompression,
+		Compression: CompressionNone,
 		TlsEnabled:  defaultTLS,
 		TlsInsecure: defaultTLSInsecure,
 	}
 	return &rs
 }
 
-// Initilalize Redis client and locker
+// Initialize Redis client and locker
 func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
+
+	// DB was validated in finalizeConfiguration; parse is safe here
+	dbInt, _ := strconv.Atoi(string(rs.DB))
 
 	// Configure options for all client types
 	clientOpts := redis.UniversalOptions{
@@ -159,7 +241,7 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 		MasterName: rs.MasterName,
 		Username:   rs.Username,
 		Password:   rs.Password,
-		DB:         rs.DB,
+		DB:         dbInt,
 	}
 
 	// Configure timeout values if defined
@@ -208,7 +290,11 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 	}
 
 	// Create appropriate Redis client type
-	if rs.ClientType == "failover" && clientOpts.MasterName != "" {
+	if rs.ClientType == "failover" && clientOpts.MasterName == "" {
+		return fmt.Errorf("'master_name' is required when using 'failover' client type")
+	}
+
+	if rs.ClientType == "failover" {
 
 		if rs.SentinelPassword != "" {
 			clientOpts.SentinelPassword = rs.SentinelPassword
@@ -261,11 +347,11 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 func (rs RedisStorage) Store(ctx context.Context, key string, value []byte) error {
 
 	var size = len(value)
-	var compressionFlag = 0
+	var compressionFlag = storageCompressionNone
 	var encryptionFlag = 0
 
 	// Compress value if compression enabled
-	if rs.Compression {
+	if rs.Compression != CompressionNone {
 		compressedValue, err := rs.compress(value)
 		if err != nil {
 			return fmt.Errorf("Unable to compress value for %s: %v", key, err)
@@ -273,7 +359,11 @@ func (rs RedisStorage) Store(ctx context.Context, key string, value []byte) erro
 		// Check compression efficiency
 		if size > len(compressedValue) {
 			value = compressedValue
-			compressionFlag = 1
+			if rs.Compression == CompressionZlib {
+				compressionFlag = storageCompressionZlib
+			} else {
+				compressionFlag = storageCompressionFlate
+			}
 		}
 	}
 
@@ -336,11 +426,11 @@ func (rs RedisStorage) Load(ctx context.Context, key string) ([]byte, error) {
 		}
 	}
 
-	// Uncompress value if compressed
-	if sd.Compression > 0 {
-		value, err = rs.uncompress(value)
+	// Decompress value if compressed
+	if sd.Compression > storageCompressionNone {
+		value, err = rs.decompress(value, sd.Compression)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to uncompress value for %s: %v", key, err)
+			return nil, fmt.Errorf("Unable to decompress value for %s: %v", key, err)
 		}
 	}
 
@@ -364,11 +454,32 @@ func (rs RedisStorage) Delete(ctx context.Context, key string) error {
 }
 
 func (rs RedisStorage) Exists(ctx context.Context, key string) bool {
+	exists, err := rs.existsKey(ctx, key)
+	if err != nil {
+		// CertMagic interface requires a boolean return only.
+		if rs.logger != nil {
+			rs.logger.Warnw("Exists check failed", "key", key, "error", err)
+		}
+		return false
+	}
+	return exists
+}
 
+func (rs RedisStorage) existsKey(ctx context.Context, key string) (bool, error) {
 	// Redis returns a count of the number of keys found
-	exists := rs.client.Exists(ctx, rs.prefixKey(key)).Val()
+	exists, err := rs.existsRawKey(ctx, rs.prefixKey(key))
+	if err != nil {
+		return false, fmt.Errorf("Unable to check existence for %s: %v", key, err)
+	}
+	return exists, nil
+}
 
-	return exists > 0
+func (rs RedisStorage) existsRawKey(ctx context.Context, redisKey string) (bool, error) {
+	existsCount, err := rs.client.Exists(ctx, redisKey).Result()
+	if err != nil {
+		return false, err
+	}
+	return existsCount > 0, nil
 }
 
 func (rs RedisStorage) List(ctx context.Context, dir string, recursive bool) ([]string, error) {
@@ -385,7 +496,7 @@ func (rs RedisStorage) List(ctx context.Context, dir string, recursive bool) ([]
 	// Iterate over each child key
 	for _, k := range keys {
 		// Directory keys will have a "/" suffix
-		trimmedKey := strings.TrimSuffix(k, "/")
+		trimmedKey := strings.TrimSuffix(k, keyPathSeparator)
 		// Reconstruct the full path of child key
 		fullPathKey := path.Join(dir, trimmedKey)
 		// If current key is a directory
@@ -429,24 +540,34 @@ func (rs *RedisStorage) Lock(ctx context.Context, name string) error {
 
 		// lock successfully obtained
 		if err == nil {
-			// store the lock in sync.map, needed for unlocking
-			rs.locks.Store(key, lock)
-			// keep the lock fresh as long as we hold it
+			refreshCtx, cancel := context.WithCancel(context.Background())
+			// store lock handle + refresh cancel function for Unlock()
+			rs.locks.Store(key, heldLock{
+				lock:   lock,
+				cancel: cancel,
+			})
+			// keep the lock fresh until Unlock() cancels refreshCtx
 			go func(ctx context.Context, lock *redislock.Lock) {
+				ticker := time.NewTicker(lockRefreshInterval)
+				defer ticker.Stop()
 				for {
-					// refresh the Redis lock
-					err := lock.Refresh(ctx, lockTTL, nil)
-					if err != nil {
-						return
-					}
-
 					select {
-					case <-time.After(lockRefreshInterval):
+					case <-ticker.C:
 					case <-ctx.Done():
 						return
 					}
+
+					// refresh the Redis lock
+					err := lock.Refresh(ctx, lockTTL, nil)
+					if err == redislock.ErrNotObtained {
+						// lock was lost (expired or released externally), stop refreshing
+						return
+					}
+					if err != nil && rs.logger != nil {
+						rs.logger.Warnw("Failed to refresh lock, will retry", "key", key, "error", err)
+					}
 				}
-			}(ctx, lock)
+			}(refreshCtx, lock)
 
 			return nil
 		}
@@ -472,11 +593,12 @@ func (rs *RedisStorage) Unlock(ctx context.Context, name string) error {
 	// load and delete lock from sync.Map
 	if syncMapLock, loaded := rs.locks.LoadAndDelete(key); loaded {
 
-		// type assertion for Redis lock
-		if lock, ok := syncMapLock.(*redislock.Lock); ok {
+		// type assertion for held lock
+		if lock, ok := syncMapLock.(heldLock); ok {
+			lock.cancel()
 
 			// release the Redis lock
-			if err := lock.Release(ctx); err != nil {
+			if err := lock.lock.Release(ctx); err != nil {
 				return fmt.Errorf("Unable to release lock for %s: %v", key, err)
 			}
 		}
@@ -514,7 +636,9 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 				trimmedKey := rs.trimKey(key)
 				sd, err := rs.loadStorageData(ctx, trimmedKey)
 				if err != nil {
-					rs.logger.Infof("Unable to load storage data for key '%s'", trimmedKey)
+					if rs.logger != nil {
+						rs.logger.Infof("Unable to load storage data for key '%s'", trimmedKey)
+					}
 					continue
 				}
 
@@ -542,15 +666,23 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 	// Iterate over each child key
 	for _, k := range keys {
 		// Directory keys will have a "/" suffix
-		trimmedKey := strings.TrimSuffix(k, "/")
+		trimmedKey := strings.TrimSuffix(k, keyPathSeparator)
 
 		// Reconstruct the full path of child key
 		fullPathKey := path.Join(dir, trimmedKey)
 
 		// Remove key from set if it does not exist
-		if !rs.Exists(ctx, fullPathKey) {
-			rs.client.ZRem(ctx, currKey, k)
-			rs.logger.Infof("Removed non-existant record '%s' from directory '%s'", k, currKey)
+		exists, err := rs.existsKey(ctx, fullPathKey)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			if err := rs.client.ZRem(ctx, currKey, k).Err(); err != nil {
+				return fmt.Errorf("Unable to remove stale record '%s' from directory '%s': %v", k, currKey, err)
+			}
+			if rs.logger != nil {
+				rs.logger.Infof("Removed non-existent record '%s' from directory '%s'", k, currKey)
+			}
 			continue
 		}
 
@@ -567,7 +699,7 @@ func (rs *RedisStorage) Repair(ctx context.Context, dir string) error {
 }
 
 func (rs *RedisStorage) trimKey(key string) string {
-	return strings.TrimPrefix(strings.TrimPrefix(key, rs.KeyPrefix), "/")
+	return strings.TrimPrefix(strings.TrimPrefix(key, rs.KeyPrefix), keyPathSeparator)
 }
 
 func (rs *RedisStorage) prefixKey(key string) string {
@@ -595,7 +727,7 @@ func (rs RedisStorage) loadStorageData(ctx context.Context, key string) (*Storag
 	return sd, nil
 }
 
-// Store directory index in Redis ZSet structure for fast and efficient travseral in List()
+// Store directory index in Redis ZSet structure for fast and efficient traversal in List()
 func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, score float64, repair, baseIsDir bool) error {
 
 	// Extract parent directory and base (file) names from key
@@ -614,11 +746,15 @@ func (rs RedisStorage) storeDirectoryRecord(ctx context.Context, key string, sco
 	// Non-zero success means base was added to the set (not already there)
 	if success > 0 || repair {
 		if success > 0 && repair {
-			rs.logger.Infof("Repaired index for record '%s' in directory '%s'", base, dir)
+			if rs.logger != nil {
+				rs.logger.Infof("Repaired index for record '%s' in directory '%s'", base, dir)
+			}
 		}
 		// recursively create parent directory until already
 		// created (success == 0) or top level reached
-		rs.storeDirectoryRecord(ctx, dir, score, repair, true)
+		if err := rs.storeDirectoryRecord(ctx, dir, score, repair, true); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -639,10 +775,16 @@ func (rs RedisStorage) deleteDirectoryRecord(ctx context.Context, key string, ba
 	}
 
 	// Check if Set "dir" still exists (removing the last item deletes the set)
-	if exists := rs.client.Exists(ctx, dir).Val(); exists == 0 {
+	exists, err := rs.existsRawKey(ctx, dir)
+	if err != nil {
+		return fmt.Errorf("Unable to check existence for %s: %v", dir, err)
+	}
+	if !exists {
 		// Recursively delete parent directory until parent
 		// is not empty (exists > 0) or top level reached
-		rs.deleteDirectoryRecord(ctx, dir, true)
+		if err := rs.deleteDirectoryRecord(ctx, dir, true); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -655,12 +797,15 @@ func (rs RedisStorage) splitDirectoryKey(key string, baseIsDir bool) (string, st
 
 	// Append slash to indicate directory
 	if baseIsDir {
-		base = base + "/"
+		base = base + keyPathSeparator
 	}
 
 	return dir, base
 }
 
+// String returns a JSON representation of the configuration with sensitive fields redacted.
+// The value receiver is intentional: Password and EncryptionKey are mutated on the copy
+// so the original struct is never modified.
 func (rs RedisStorage) String() string {
 	redacted := `REDACTED`
 	if rs.Password != "" {

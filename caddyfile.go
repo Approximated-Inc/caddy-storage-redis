@@ -1,3 +1,17 @@
+// Copyright 2024 Pieter Berkel
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package storageredis
 
 import (
@@ -7,6 +21,7 @@ import (
 	"net"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -86,11 +101,7 @@ func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			case "port":
 				rs.Port = configVal
 			case "db":
-				dbParse, err := strconv.Atoi(configVal[0])
-				if err != nil {
-					return d.Errf("invalid db value: %s", configVal[0])
-				}
-				rs.DB = dbParse
+				rs.DB = DBIndex(configVal[0])
 			case "timeout":
 				rs.Timeout = configVal[0]
 			case "username":
@@ -116,11 +127,23 @@ func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			case "encryption_key", "aes_key":
 				rs.EncryptionKey = configVal[0]
 			case "compression":
-				Compression, err := strconv.ParseBool(configVal[0])
-				if err != nil {
-					return d.Errf("invalid boolean value for 'compression': %s", configVal[0])
+				// Accept legacy bool values (true/false, 1/0, t/f, etc.) for backwards
+				// compatibility, mapping true → "flate". If ParseBool fails, expect one
+				// of the named algorithm strings.
+				if b, err := strconv.ParseBool(configVal[0]); err == nil {
+					if b {
+						rs.Compression = CompressionFlate
+					} else {
+						rs.Compression = CompressionNone
+					}
+				} else {
+					switch CompressionMode(configVal[0]) {
+					case CompressionFlate, CompressionZlib:
+						rs.Compression = CompressionMode(configVal[0])
+					default:
+						return d.Errf("invalid value for 'compression': %s (expected 'true', 'flate', 'zlib', or 'false')", configVal[0])
+					}
 				}
-				rs.Compression = Compression
 			case "tls_enabled":
 				TlsEnabledParse, err := strconv.ParseBool(configVal[0])
 				if err != nil {
@@ -153,6 +176,8 @@ func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid boolean value for 'route_randomly': %s", configVal[0])
 				}
 				rs.RouteRandomly = routeRandomly
+			default:
+				return d.Errf("unknown configuration key: %s", configKey)
 			}
 		}
 	}
@@ -211,13 +236,19 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 	rs.MasterName = repl.ReplaceAll(rs.MasterName, "")
 	rs.Username = repl.ReplaceAll(rs.Username, "")
 	rs.Password = repl.ReplaceAll(rs.Password, "")
+	rs.SentinelPassword = repl.ReplaceAll(rs.SentinelPassword, "")
 	rs.KeyPrefix = repl.ReplaceAll(rs.KeyPrefix, defaultKeyPrefix)
+	keyPrefix, err := normalizeKeyPrefix(rs.KeyPrefix)
+	if err != nil {
+		return err
+	}
+	rs.KeyPrefix = keyPrefix
 
 	if len(rs.EncryptionKey) > 0 {
 		rs.EncryptionKey = repl.ReplaceAll(rs.EncryptionKey, "")
 		// Encryption_key length must be at least 32 characters
 		if len(rs.EncryptionKey) < 32 {
-			return fmt.Errorf("invalid length for 'encryption_key', must contain at least 32 bytes: %s", rs.EncryptionKey)
+			return fmt.Errorf("invalid length for 'encryption_key', must contain at least 32 bytes")
 		}
 		// Truncate keys that are too long
 		if len(rs.EncryptionKey) > 32 {
@@ -228,9 +259,24 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 	rs.TlsServerCertsPEM = repl.ReplaceAll(rs.TlsServerCertsPEM, "")
 	rs.TlsServerCertsPath = repl.ReplaceAll(rs.TlsServerCertsPath, "")
 
+	switch CompressionMode(repl.ReplaceAll(string(rs.Compression), "")) {
+	case CompressionNone, "false":
+		rs.Compression = CompressionNone
+	case CompressionFlate, "true":
+		rs.Compression = CompressionFlate
+	case CompressionZlib:
+		rs.Compression = CompressionZlib
+	default:
+		return fmt.Errorf("invalid compression value: %q (expected 'flate', 'zlib', or 'false')", rs.Compression)
+	}
+
+	rs.DB = DBIndex(repl.ReplaceAll(string(rs.DB), defaultDb))
+	dbInt, err := strconv.Atoi(string(rs.DB))
+	if err != nil || dbInt < 0 {
+		return fmt.Errorf("invalid db value: %s", rs.DB)
+	}
+
 	// TODO: these are non-string fields so they can't easily be substituted at runtime :(
-	// rs.DB
-	// rs.Compression
 	// rs.TlsEnabled
 	// rs.TlsInsecure
 	// rs.RouteByLatency
@@ -246,11 +292,7 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 		maxPorts := len(rs.Port)
 
 		// Determine max number of addresses
-		if maxHosts > maxPorts {
-			maxAddrs = maxHosts
-		} else {
-			maxAddrs = maxPorts
-		}
+		maxAddrs = max(maxHosts, maxPorts)
 
 		for i := 0; i < maxAddrs; i++ {
 			if i < maxHosts {
@@ -267,6 +309,20 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 	}
 
 	return rs.initRedisClient(ctx)
+}
+
+func normalizeKeyPrefix(prefix string) (string, error) {
+	p := strings.TrimSpace(prefix)
+	p = strings.Trim(p, keyPathSeparator)
+	if p != "" {
+		// Malformed prefixes might cause problems for path.Join() later
+		for segment := range strings.SplitSeq(p, keyPathSeparator) {
+			if segment == "" || segment == "." || segment == ".." {
+				return "", fmt.Errorf("invalid key_prefix segment: %q", segment)
+			}
+		}
+	}
+	return p, nil
 }
 
 func (rs *RedisStorage) Cleanup() error {
@@ -307,7 +363,7 @@ func cmdRedisStorageRepair(fl caddycmd.Flags) (int, error) {
 		return caddy.ExitCodeFailedStartup, err
 	}
 	// Ensure loaded module is the correct type
-	if reflect.TypeOf(module) != reflect.TypeOf(&RedisStorage{}) {
+	if reflect.TypeOf(module) != reflect.TypeFor[*RedisStorage]() {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("Loaded storage module does not support Redis")
 	}
 

@@ -1,3 +1,17 @@
+// Copyright 2024 Pieter Berkel
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package storageredis
 
 import (
@@ -5,29 +19,30 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
 const (
-	TestDB            = 9
-	TestKeyPrefix     = "redistlstest"
-	TestEncryptionKey = "1aedfs5kcM8lOZO3BDDMuwC23croDwRr"
-	TestCompression   = true
+	TestDB            DBIndex = "9"
+	TestKeyPrefix             = "redistlstest"
+	TestEncryptionKey         = "1aedfs5kcM8lOZO3BDDMuwC23croDwRr"
+	TestCompression           = CompressionFlate
 
-	TestKeyCertPath       = "certificates"
-	TestKeyAcmePath       = TestKeyCertPath + "/acme-v02.api.letsencrypt.org-directory"
-	TestKeyExamplePath    = TestKeyAcmePath + "/example.com"
-	TestKeyExampleCrt     = TestKeyExamplePath + "/example.com.crt"
-	TestKeyExampleKey     = TestKeyExamplePath + "/example.com.key"
-	TestKeyExampleJson    = TestKeyExamplePath + "/example.com.json"
-	TestKeyLock           = "locks/issue_cert_example.com"
-	TestKeyLockIterations = 250
+	TestKeyCertPath    = "certificates"
+	TestKeyAcmePath    = TestKeyCertPath + "/acme-v02.api.letsencrypt.org-directory"
+	TestKeyExamplePath = TestKeyAcmePath + "/example.com"
+	TestKeyExampleCrt  = TestKeyExamplePath + "/example.com.crt"
+	TestKeyExampleKey  = TestKeyExamplePath + "/example.com.key"
+	TestKeyExampleJson = TestKeyExamplePath + "/example.com.json"
+	TestKeyLock        = "locks/issue_cert_example.com"
 )
 
 var (
@@ -38,6 +53,11 @@ var (
 
 // Emulate the Provision() Caddy function
 func provisionRedisStorage(t *testing.T) (*RedisStorage, context.Context) {
+	t.Helper()
+
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
 
 	ctx := context.Background()
 	rs := New()
@@ -45,23 +65,19 @@ func provisionRedisStorage(t *testing.T) (*RedisStorage, context.Context) {
 	logger, _ := zap.NewProduction()
 	rs.logger = logger.Sugar()
 
+	rs.Address = []string{mr.Addr()}
 	rs.DB = TestDB
 	rs.KeyPrefix = TestKeyPrefix
 	rs.EncryptionKey = TestEncryptionKey
 	rs.Compression = TestCompression
 
-	err := rs.finalizeConfiguration(ctx)
-	assert.NoError(t, err)
-
-	// Skip test if unable to connect to Redis server
-	if err != nil {
-		t.Skip()
-		return nil, nil
-	}
+	err = rs.finalizeConfiguration(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rs.Cleanup() })
 
 	// Flush the current Redis database
 	err = rs.client.FlushDB(ctx).Err()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	return rs, ctx
 }
@@ -274,33 +290,33 @@ func TestRedisStorage_LockUnlock(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestRedisStorage_MultipleLocks(t *testing.T) {
+func TestRedisStorage_LockContention(t *testing.T) {
 
+	rs, ctx := provisionRedisStorage(t)
+
+	const goroutines = 5
 	var wg sync.WaitGroup
-	var rsArray = make([]*RedisStorage, TestKeyLockIterations)
+	var concurrent int32
 
-	for i := 0; i < len(rsArray); i++ {
-		rsArray[i], _ = provisionRedisStorage(t)
-		wg.Add(1)
-	}
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
 
-	for i := 0; i < len(rsArray); i++ {
-		suffix := strconv.Itoa(i / 10)
-		go lockAndUnlock(t, &wg, rsArray[i], TestKeyLock+"-"+suffix)
+			err := rs.Lock(ctx, TestKeyLock)
+			assert.NoError(t, err)
+
+			// Assert mutual exclusion: counter must be exactly 1 while lock is held
+			held := atomic.AddInt32(&concurrent, 1)
+			assert.Equal(t, int32(1), held, "multiple goroutines held the lock simultaneously")
+			atomic.AddInt32(&concurrent, -1)
+
+			err = rs.Unlock(ctx, TestKeyLock)
+			assert.NoError(t, err)
+		}()
 	}
 
 	wg.Wait()
-}
-
-func lockAndUnlock(t *testing.T, wg *sync.WaitGroup, rs *RedisStorage, key string) {
-
-	defer wg.Done()
-
-	err := rs.Lock(context.Background(), key)
-	assert.NoError(t, err)
-
-	err = rs.Unlock(context.Background(), key)
-	assert.NoError(t, err)
 }
 
 func TestRedisStorage_String(t *testing.T) {
