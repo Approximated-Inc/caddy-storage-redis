@@ -619,6 +619,14 @@ func (rs *RedisStorage) Lock(ctx context.Context, name string) error {
 						// lock was lost (expired or released externally), stop refreshing
 						return
 					}
+					if isClientClosedErr(err) {
+						// Cached client was closed by Caddy reload (Cleanup).
+						// The new storage instance will own future refreshes;
+						// keep looping here only produces 3s-cadence log noise
+						// until Unlock fires its cancel. Exit so the orphan
+						// goroutine reaps cleanly.
+						return
+					}
 					if err != nil && rs.logger != nil {
 						rs.logger.Warnw("Failed to refresh lock, will retry", "key", key, "error", err)
 					}
