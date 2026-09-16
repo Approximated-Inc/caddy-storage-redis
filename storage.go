@@ -463,6 +463,7 @@ func (rs RedisStorage) Load(ctx context.Context, key string) ([]byte, error) {
 		}
 	}
 
+	observeCertificateLoad(ctx, key, value)
 	return value, nil
 }
 
