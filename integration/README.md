@@ -90,3 +90,30 @@ The configuration generator must omit it on unsupported client-auth policies;
 `LocalCertificateProbe.ClientAuth` also skips such policies before dialing.
 This is a passive detector and confirmation primitive; delivery, app-side
 validation, writer repair, deployment, and production trust remain later tasks.
+
+### Certificate reporter lifecycle and trust fixture
+
+Run `GOCACHE=/private/tmp/apx-cert-go-cache ./test-caddy-version.sh v2.11.3`
+and the same command with `v2.11.4`. This executes the production reporter and
+production handshake hook, including 20 actual Caddy reloads, failed replacement
+configs, cancellation of blocked HTTPS requests on disable/credential changes,
+and real nonce-bound verifications of the freshly served certificate at30 and60
+seconds (a202 success must keep the root scheduled until204 or expiry).
+The existing gated Task2 observer tests use a renamed test app/context adapter;
+they retain their exact direct/L4 recursive storage-read measurements.
+
+The matrix script copies the exact version-resolved Caddy source into disposable
+scratch and applies a Go build overlay removing only `cmd/x509rootsfallback.go`'s
+blank import of the bundled fallback-root installer. It checks that import before
+applying the overlay and never edits the module cache or production dependencies.
+This is necessary because Go permits `x509.SetFallbackRoots` only once. Each test
+child installs only the fixture leaf CA and fake HTTPS app CA, using test-only
+`GODEBUG=x509usefallbackroots=1`; production `RootCAs` stays nil for both connections.
+No OS/user trust store is changed. Raw opt-in `go test` runs fail with instructions
+for the real reporter tests if the script's overlay marker is absent, rather than
+silently treating them as covered.
+
+This overlay is a test-harness divergence. The later Linux built-image gate must
+retain Caddy's actual compiled fallback import and use process-local
+`SSL_CERT_FILE`/`SSL_CERT_DIR` trust for its synthetic endpoint. These tests do not
+claim that image gate, production deployment, app recovery, or ACME issuance.

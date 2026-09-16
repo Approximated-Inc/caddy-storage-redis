@@ -37,7 +37,7 @@ func (s fixtureReportSink) TryEnqueue(c storageredis.MismatchCandidate) bool {
 	return true
 }
 func (*fixtureHealthApp) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{ID: "apx_certificate_health", New: func() caddy.Module { return new(fixtureHealthApp) }}
+	return caddy.ModuleInfo{ID: "test_certificate_health", New: func() caddy.Module { return new(fixtureHealthApp) }}
 }
 func (a *fixtureHealthApp) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
@@ -84,9 +84,9 @@ func (f *fixture) startHealthNode(t *testing.T, auth bool, options ...bool) *nod
 	gate := len(options) > 1 && options[1]
 	return f.startNodeConfigured(t, func(config map[string]any, n *node) {
 		apps := config["apps"].(map[string]any)
-		apps["apx_certificate_health"] = map[string]any{"events": n.events, "address": n.address, "roots": string(f.rootPEM), "client_auth": auth}
+		apps["test_certificate_health"] = map[string]any{"events": n.events, "address": n.address, "roots": string(f.rootPEM), "client_auth": auth}
 		if gate {
-			apps["apx_certificate_health"].(map[string]any)["gate"] = n.events + ".probe-ready"
+			apps["test_certificate_health"].(map[string]any)["gate"] = n.events + ".probe-ready"
 		}
 		server := apps["http"].(map[string]any)["servers"].(map[string]any)["fixture"].(map[string]any)
 		server["listener_wrappers"] = []any{map[string]any{"wrapper": "proxy_protocol", "timeout": "5s", "fallback_policy": "use"}, map[string]any{"wrapper": "tls"}}
@@ -105,7 +105,7 @@ func (f *fixture) startHealthNode(t *testing.T, auth bool, options ...bool) *nod
 			delete(policy, "handshake_context")
 			policy["client_authentication"] = map[string]any{"mode": "require"}
 		} else {
-			policy["handshake_context"] = map[string]any{"module": "apx_certificate_health"}
+			policy["handshake_context"] = map[string]any{"module": "test_certificate_health"}
 		}
 	})
 }
@@ -193,11 +193,11 @@ func TestStoredMismatchHealthyFallbackIssuer(t *testing.T) {
 	f.leaf = leaf
 	n := f.startNodeConfigured(t, func(config map[string]any, n *node) {
 		apps := config["apps"].(map[string]any)
-		apps["apx_certificate_health"] = map[string]any{"events": n.events, "address": n.address, "roots": string(f.rootPEM), "gate": n.events + ".probe-ready"}
+		apps["test_certificate_health"] = map[string]any{"events": n.events, "address": n.address, "roots": string(f.rootPEM), "gate": n.events + ".probe-ready"}
 		policy := apps["tls"].(map[string]any)["automation"].(map[string]any)["policies"].([]any)[0].(map[string]any)
 		policy["issuers"] = []any{map[string]any{"module": "test_fixture", "events": n.events}, map[string]any{"module": "test_fixture", "events": n.events, "key": "fallback-fixture"}}
 		server := apps["http"].(map[string]any)["servers"].(map[string]any)["fixture"].(map[string]any)
-		server["tls_connection_policies"].([]any)[0].(map[string]any)["handshake_context"] = map[string]any{"module": "apx_certificate_health"}
+		server["tls_connection_policies"].([]any)[0].(map[string]any)["handshake_context"] = map[string]any{"module": "test_certificate_health"}
 	})
 	gets := f.redisGets(t)
 	f.assertHealthy(t, n)
@@ -232,3 +232,20 @@ func TestCertificateObserverAbsentReporter(t *testing.T) {
 	require.Zero(t, countEvents(t, n, "candidate"))
 	require.Zero(t, countEvents(t, n, "confirmed"))
 }
+
+// Test-only adapter preserves the reviewed gated observer/probe measurements.
+// The production module still retrieves only the real apx_certificate_health app.
+type fixtureHealthContext struct { hook *storageredis.CertificateHealthContext }
+func (fixtureHealthContext) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{ID: "tls.context.test_certificate_health", New: func() caddy.Module { return new(fixtureHealthContext) }}
+}
+func (h *fixtureHealthContext) Provision(ctx caddy.Context) error {
+	app, err := ctx.App("test_certificate_health")
+	if err != nil { return err }
+	h.hook = storageredis.NewCertificateHealthContext(app.(storageredis.MismatchSink))
+	return nil
+}
+func (h *fixtureHealthContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	return h.hook.HandshakeContext(hello)
+}
+func init() { caddy.RegisterModule(fixtureHealthContext{}) }

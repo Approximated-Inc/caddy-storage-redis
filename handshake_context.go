@@ -30,3 +30,10 @@ func (h *CertificateHealthContext) HandshakeContext(hello *tls.ClientHelloInfo) 
 	}
 	return context.WithValue(ctx, observerContextKey{}, newCertificateObserver(hello.ServerName, h.sink)), nil
 }
+
+// NewCertificateHealthContext binds the passive observer to a nonblocking sink.
+// Embedders and the gated integration fixture can supply a sink without changing
+// the production module's fixed app lookup or adding a JSON configuration knob.
+func NewCertificateHealthContext(sink MismatchSink) *CertificateHealthContext {
+	return &CertificateHealthContext{sink: sink}
+}

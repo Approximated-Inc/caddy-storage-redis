@@ -2,6 +2,8 @@ package integration
 
 import (
 	"bytes"
+	"bufio"
+	"runtime"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -42,6 +44,7 @@ type event struct {
 	Kind      string                          `json:"kind"`
 	Candidate *storageredis.MismatchCandidate `json:"candidate,omitempty"`
 	Key       string                          `json:"key,omitempty"`
+	Stats *storageredis.CertificateReporterStats `json:"stats,omitempty"`
 	Handshake bool                            `json:"handshake,omitempty"`
 }
 
@@ -119,11 +122,42 @@ func TestCaddyProcess(t *testing.T) {
 	if path == "" {
 		t.Skip("subprocess entry point")
 	}
+	if rootsPath := os.Getenv("APX_TEST_FALLBACK_ROOTS"); rootsPath != "" {
+		pem, err := os.ReadFile(rootsPath)
+		require.NoError(t, err)
+		pool := x509.NewCertPool()
+		require.True(t, pool.AppendCertsFromPEM(pem))
+		x509.SetFallbackRoots(pool)
+	}
 	config, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.NoError(t, caddy.Load(config, true))
 	require.NoError(t, os.WriteFile(path+".ready", []byte("ready"), 0600))
-	_, _ = io.Copy(io.Discard, os.Stdin)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	sequence := 0
+	for scanner.Scan() {
+		sequence++
+		var command childCommand
+		require.NoError(t, json.Unmarshal(scanner.Bytes(), &command))
+		previous := currentReporter
+		response := childResponse{}
+		if len(command.Config) > 0 {
+			if err := caddy.Load(command.Config, true); err != nil {
+				response.Error = err.Error()
+				currentReporter = previous
+			}
+		}
+		if currentReporter != nil { response.Stats = currentReporter.Stats() }
+		if previous != nil { response.Previous = previous.Stats() }
+		response.Goroutines = runtime.NumGoroutine()
+		encoded, err := json.Marshal(response)
+		require.NoError(t, err)
+		responsePath := fmt.Sprintf("%s.command-%d", path, sequence)
+		require.NoError(t, os.WriteFile(responsePath+".tmp", encoded, 0600))
+		require.NoError(t, os.Rename(responsePath+".tmp", responsePath))
+	}
+	require.NoError(t, scanner.Err())
 	require.NoError(t, caddy.Stop())
 }
 
@@ -263,7 +297,14 @@ func (f *fixture) assertMismatch(t *testing.T) {
 	require.ErrorContains(t, err, "private key does not match public key")
 }
 
-type node struct{ address, events, logs string }
+type node struct {
+	address, events, logs string
+	configPath string
+	config map[string]any
+	input io.WriteCloser
+	sequence int
+	testRoots []byte
+}
 
 func (f *fixture) startNode(t *testing.T) *node { return f.startNodeConfigured(t, nil) }
 func (f *fixture) startNodeConfigured(t *testing.T, configure func(map[string]any, *node)) *node {
@@ -309,14 +350,21 @@ func (f *fixture) startNodeConfigured(t *testing.T, configure func(map[string]an
 	configBytes, err := json.Marshal(config)
 	require.NoError(t, err)
 	configPath := filepath.Join(dir, "caddy.json")
+	n.configPath, n.config = configPath, config
 	require.NoError(t, os.WriteFile(configPath, configBytes, 0600))
 	executable, err := os.Executable()
 	require.NoError(t, err)
 	cmd := exec.Command(executable, "-test.run=^TestCaddyProcess$", "-test.v")
 	// No user Redis credentials/config; no root trust installation.
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "XDG_DATA_HOME=" + dir, "XDG_CONFIG_HOME=" + dir, "APX_TEST_CADDY_CONFIG=" + configPath}
+	if len(n.testRoots) > 0 {
+		rootPath := filepath.Join(dir, "fallback-roots.pem")
+		require.NoError(t, os.WriteFile(rootPath, n.testRoots, 0600))
+		cmd.Env = append(cmd.Env, "APX_TEST_FALLBACK_ROOTS="+rootPath, "GODEBUG=x509usefallbackroots=1", "FLY_MACHINE_ID=123456789abcde")
+	}
 	input, err := cmd.StdinPipe()
 	require.NoError(t, err)
+	n.input = input
 	logFile, err := os.Create(n.logs)
 	require.NoError(t, err)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
