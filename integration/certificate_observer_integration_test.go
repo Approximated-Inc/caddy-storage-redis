@@ -235,13 +235,18 @@ func TestCertificateObserverAbsentReporter(t *testing.T) {
 
 // Test-only adapter preserves the reviewed gated observer/probe measurements.
 // The production module still retrieves only the real apx_certificate_health app.
-type fixtureHealthContext struct { hook *storageredis.CertificateHealthContext }
+type fixtureHealthContext struct {
+	hook *storageredis.CertificateHealthContext
+}
+
 func (fixtureHealthContext) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{ID: "tls.context.test_certificate_health", New: func() caddy.Module { return new(fixtureHealthContext) }}
 }
 func (h *fixtureHealthContext) Provision(ctx caddy.Context) error {
 	app, err := ctx.App("test_certificate_health")
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	h.hook = storageredis.NewCertificateHealthContext(app.(storageredis.MismatchSink))
 	return nil
 }

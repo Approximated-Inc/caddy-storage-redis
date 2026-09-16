@@ -2,8 +2,8 @@ package storageredis
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -33,7 +33,7 @@ func failedProbe(context.Context, string) CertificateProbeResult {
 func acceptedResponse(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(202)
-	json.NewEncoder(w).Encode(map[string]any{"report_id": "12345678-1234-4234-8234-123456789abc", "verification_nonce": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "check_after_seconds": 30, "expires_at": time.Now().Add(5*time.Minute).UTC().Format(time.RFC3339)})
+	json.NewEncoder(w).Encode(map[string]any{"report_id": "12345678-1234-4234-8234-123456789abc", "verification_nonce": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "check_after_seconds": 30, "expires_at": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)})
 }
 func TestCertificateReporterConfiguration(t *testing.T) {
 	for _, modify := range []func(*CertificateReporter){
@@ -72,7 +72,9 @@ func TestCertificateReporterDelivery(t *testing.T) {
 				require.Len(t, r.Header.Values("apx-key"), 1)
 				var event certificateEvent
 				require.NoError(t, json.NewDecoder(r.Body).Decode(&event))
-				mu.Lock(); bodies = append(bodies, event.EventID); mu.Unlock()
+				mu.Lock()
+				bodies = append(bodies, event.EventID)
+				mu.Unlock()
 				w.WriteHeader(status)
 			}))
 			defer server.Close()
@@ -80,11 +82,16 @@ func TestCertificateReporterDelivery(t *testing.T) {
 			defer s.stop()
 			require.Eventually(t, func() bool { return s.TryEnqueue(reportCandidate("fixture.example")) }, time.Second, time.Millisecond)
 			want := 1
-			if status == 429 || status == 503 { want = 3 }
+			if status == 429 || status == 503 {
+				want = 3
+			}
 			require.Eventually(t, func() bool { return s.snapshot().Active == 0 }, 12*time.Second, 10*time.Millisecond)
-			mu.Lock(); defer mu.Unlock()
+			mu.Lock()
+			defer mu.Unlock()
 			require.Len(t, bodies, want)
-			for _, id := range bodies { require.Equal(t, bodies[0], id) }
+			for _, id := range bodies {
+				require.Equal(t, bodies[0], id)
+			}
 			require.False(t, s.TryEnqueue(reportCandidate("fixture.example")), "terminal dedupe retained for root lifetime")
 		})
 	}
@@ -96,9 +103,14 @@ func TestCertificateReporterResponseLostAfterCommit(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var event certificateEvent
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&event))
-		mu.Lock(); ids = append(ids, event.EventID); mu.Unlock()
+		mu.Lock()
+		ids = append(ids, event.EventID)
+		mu.Unlock()
 		if requests.Add(1) == 1 {
-			c, _, err := w.(http.Hijacker).Hijack(); require.NoError(t, err); c.Close(); return
+			c, _, err := w.(http.Hijacker).Hijack()
+			require.NoError(t, err)
+			c.Close()
+			return
 		}
 		acceptedResponse(w)
 	}))
@@ -107,7 +119,8 @@ func TestCertificateReporterResponseLostAfterCommit(t *testing.T) {
 	defer s.stop()
 	require.Eventually(t, func() bool { return s.TryEnqueue(reportCandidate("fixture.example")) }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return s.snapshot().Accepted == 1 }, 6*time.Second, time.Millisecond)
-	mu.Lock(); defer mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 	require.Len(t, ids, 2)
 	require.Equal(t, ids[0], ids[1])
 	require.Equal(t, 1, s.snapshot().Active)
@@ -143,14 +156,18 @@ func TestCertificateReporterInitialObservationAndLifetime(t *testing.T) {
 	defer server.Close()
 	s := newTestCertificateReporterState(reporterConfig(server.URL), server.Client(), failedProbe, nil)
 	defer s.stop()
-	birth := time.Now().Add(-20*time.Second).UTC().Truncate(time.Second)
+	birth := time.Now().Add(-20 * time.Second).UTC().Truncate(time.Second)
 	// Deterministically seed an already-waiting candidate before a worker sees it.
 	s.mu.Lock()
 	w := &certificateWork{candidate: reportCandidate("fixture.example"), birth: birth, due: time.Now(), expires: birth.Add(certificateLifetime)}
 	s.work["fixture.example"] = w
 	s.mu.Unlock()
 	var event certificateEvent
-	select { case event = <-events: case <-time.After(time.Second): t.Fatal("no initial report") }
+	select {
+	case event = <-events:
+	case <-time.After(time.Second):
+		t.Fatal("no initial report")
+	}
 	require.Equal(t, birth.Format(time.RFC3339), event.ObservedAt, "initial observation must retain candidate birth")
 	require.NotEqual(t, event.ObservedAt, event.TLSCheckedAt)
 	require.Eventually(t, func() bool { s.mu.Lock(); defer s.mu.Unlock(); return !w.busy && w.acceptance != nil }, time.Second, time.Millisecond)
@@ -194,7 +211,10 @@ func TestCertificateReporterTransportBounds(t *testing.T) {
 		require.Equal(t, uint64(1), s.snapshot().Failures)
 	})
 	t.Run("response bound", func(t *testing.T) {
-		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(202); w.Write([]byte(strings.Repeat(" ", 8193))) }))
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(202)
+			w.Write([]byte(strings.Repeat(" ", 8193)))
+		}))
 		defer server.Close()
 		s := newTestCertificateReporterState(reporterConfig(server.URL), server.Client(), failedProbe, nil)
 		defer s.stop()
@@ -206,7 +226,13 @@ func TestCertificateReporterTransportBounds(t *testing.T) {
 	t.Run("total timeout and cancellation", func(t *testing.T) {
 		entered := make(chan struct{}, 4)
 		release := make(chan struct{})
-		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { entered <- struct{}{}; select { case <-r.Context().Done(): case <-release: } }))
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			entered <- struct{}{}
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}))
 		defer server.Close()
 		defer close(release)
 		s := newTestCertificateReporterState(reporterConfig(server.URL), server.Client(), failedProbe, nil)
@@ -226,21 +252,26 @@ func TestCertificateReporterTransportBounds(t *testing.T) {
 }
 func TestCertificateReporterQueueBoundsAndEviction(t *testing.T) {
 	entered := make(chan struct{}, 2)
-	probe := func(ctx context.Context, _ string) CertificateProbeResult { entered <- struct{}{}; <-ctx.Done(); return CertificateProbeResult{} }
+	probe := func(ctx context.Context, _ string) CertificateProbeResult {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return CertificateProbeResult{}
+	}
 	s := newTestCertificateReporterState(reporterConfig("https://app.example"), &http.Client{}, probe, nil)
 	defer s.stop()
 	for i := 0; i < certificateQueueCapacity; i++ {
 		candidate := reportCandidate(fmt.Sprintf("host%d.example", i))
 		require.Eventually(t, func() bool { return s.TryEnqueue(candidate) }, time.Second, time.Millisecond)
 	}
-	<-entered; <-entered
+	<-entered
+	<-entered
 	require.Equal(t, 256, s.snapshot().Active)
 	require.Equal(t, 2, s.snapshot().Workers)
 	require.False(t, s.TryEnqueue(reportCandidate("overflow.example")))
 	require.False(t, s.TryEnqueue(reportCandidate("host0.example")))
 	// Expiry cleanup retains the two bounded in-flight entries until cancellation.
 	s.mu.Lock()
-	s.prune(time.Now().Add(6*time.Minute))
+	s.prune(time.Now().Add(6 * time.Minute))
 	require.Len(t, s.work, 2)
 	require.Empty(t, s.dedupe)
 	for i := 0; i < 1024; i++ {
@@ -273,8 +304,10 @@ func TestCertificateReporterContinuation(t *testing.T) {
 			var probes atomic.Int32
 			probe := func(context.Context, string) CertificateProbeResult {
 				n := probes.Add(1)
-				result := CertificateProbeResult{Result: TLSAlert, CheckedAt: time.Now().Add(time.Duration(n-1)*time.Second).UTC().Truncate(time.Second)}
-				if n > 1 && healthy { result.Result, result.ServedLeafSHA256 = TLSValid, strings.Repeat("d", 64) }
+				result := CertificateProbeResult{Result: TLSAlert, CheckedAt: time.Now().Add(time.Duration(n-1) * time.Second).UTC().Truncate(time.Second)}
+				if n > 1 && healthy {
+					result.Result, result.ServedLeafSHA256 = TLSValid, strings.Repeat("d", 64)
+				}
 				return result
 			}
 			s := newTestCertificateReporterState(reporterConfig(server.URL), server.Client(), probe, nil)
@@ -282,15 +315,22 @@ func TestCertificateReporterContinuation(t *testing.T) {
 			require.Eventually(t, func() bool { return s.TryEnqueue(reportCandidate("fixture.example")) }, time.Second, time.Millisecond)
 			first := <-events
 			require.Eventually(t, func() bool {
-				s.mu.Lock(); defer s.mu.Unlock()
+				s.mu.Lock()
+				defer s.mu.Unlock()
 				w := s.work["fixture.example"]
-				if w == nil || w.busy || w.acceptance == nil { return false }
+				if w == nil || w.busy || w.acceptance == nil {
+					return false
+				}
 				require.Greater(t, time.Until(w.due), 29*time.Second)
 				w.due = time.Now()
 				return true
 			}, time.Second, time.Millisecond)
 			var next certificateEvent
-			select { case next = <-events: case <-time.After(time.Second): t.Fatal("no continuation") }
+			select {
+			case next = <-events:
+			case <-time.After(time.Second):
+				t.Fatal("no continuation")
+			}
 			require.NotEqual(t, first.EventID, next.EventID)
 			require.Equal(t, "12345678-1234-4234-8234-123456789abc", next.ReportID)
 			require.Equal(t, base64.RawURLEncoding.EncodeToString(make([]byte, 32)), next.VerificationNonce)
@@ -302,28 +342,38 @@ func TestCertificateReporterContinuation(t *testing.T) {
 				require.Empty(t, next.LeafSHA256)
 				require.Empty(t, next.CertificateSPKISHA256)
 				require.Empty(t, next.KeySPKISHA256)
-				require.Equal(t, strings.Repeat("d",64), next.ServedLeafSHA256)
+				require.Equal(t, strings.Repeat("d", 64), next.ServedLeafSHA256)
 				var originalExpiry time.Time
 				require.Eventually(t, func() bool {
-					s.mu.Lock(); defer s.mu.Unlock()
+					s.mu.Lock()
+					defer s.mu.Unlock()
 					w := s.work["fixture.example"]
-					if w == nil || w.busy || w.event != nil { return false }
+					if w == nil || w.busy || w.event != nil {
+						return false
+					}
 					originalExpiry = w.expires
 					require.Equal(t, expires, w.acceptance.ExpiresAt)
 					w.due = time.Now()
 					return true
 				}, time.Second, time.Millisecond, "202 accepts verification; only204 or expiry ends the root")
 				var later certificateEvent
-				select { case later = <-events: case <-time.After(time.Second): t.Fatal("no later accepted-success observation") }
+				select {
+				case later = <-events:
+				case <-time.After(time.Second):
+					t.Fatal("no later accepted-success observation")
+				}
 				require.Equal(t, "verification", later.Kind)
 				require.NotEqual(t, next.EventID, later.EventID)
 				require.Greater(t, later.ObservedAt, next.ObservedAt)
 				require.Equal(t, next.ReportID, later.ReportID)
 				require.Equal(t, next.VerificationNonce, later.VerificationNonce)
 				require.Eventually(t, func() bool {
-					s.mu.Lock(); defer s.mu.Unlock()
+					s.mu.Lock()
+					defer s.mu.Unlock()
 					w := s.work["fixture.example"]
-					if w == nil || w.busy { return false }
+					if w == nil || w.busy {
+						return false
+					}
 					require.Equal(t, originalExpiry, w.expires)
 					return true
 				}, time.Second, time.Millisecond)
@@ -340,16 +390,26 @@ func TestCertificateReporterContinuation(t *testing.T) {
 func TestCertificateReporterRootDeadlineCancelsDelivery(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { entered <- struct{}{}; select { case <-r.Context().Done(): case <-release: } }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
 	defer server.Close()
 	defer close(release)
 	s := newTestCertificateReporterState(reporterConfig(server.URL), server.Client(), failedProbe, nil)
 	defer s.stop()
 	now := time.Now()
 	s.mu.Lock()
-	s.work["fixture.example"] = &certificateWork{candidate: reportCandidate("fixture.example"), birth: now.Add(-certificateLifetime+time.Second), due: now, expires: now.Add(time.Second)}
+	s.work["fixture.example"] = &certificateWork{candidate: reportCandidate("fixture.example"), birth: now.Add(-certificateLifetime + time.Second), due: now, expires: now.Add(time.Second)}
 	s.mu.Unlock()
-	select { case <-entered: case <-time.After(time.Second): t.Fatal("no report") }
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("no report")
+	}
 	require.Eventually(t, func() bool { return s.snapshot().Active == 0 }, 2*time.Second, time.Millisecond)
 	require.Equal(t, uint64(1), s.snapshot().Failures)
 	require.Less(t, time.Since(now), 2*time.Second)
@@ -392,7 +452,10 @@ func TestCertificateReporterTerminalStatusDoesNotWaitForBody(t *testing.T) {
 				requests.Add(1)
 				w.WriteHeader(status)
 				w.(http.Flusher).Flush()
-				select { case <-release: case <-r.Context().Done(): }
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
 			}))
 			defer server.Close()
 			defer close(release)
@@ -417,7 +480,10 @@ func TestCertificateReporterConcurrentReferencesAndProvisionalCleanup(t *testing
 		go func(c *CertificateReporter) { defer wg.Done(); require.NoError(t, c.Start()) }(copies[i])
 	}
 	wg.Wait()
-	for _, copy := range copies { require.Same(t, original.state.Load(), copy.state.Load()); require.NoError(t, copy.Stop()) }
+	for _, copy := range copies {
+		require.Same(t, original.state.Load(), copy.state.Load())
+		require.NoError(t, copy.Stop())
+	}
 	require.Eventually(t, func() bool { return original.Stats().Workers == 2 }, time.Second, time.Millisecond)
 	first := reporterConfig("https://first.example")
 	second := reporterConfig("https://second.example")
@@ -426,5 +492,5 @@ func TestCertificateReporterConcurrentReferencesAndProvisionalCleanup(t *testing
 	require.NoError(t, second.Start())
 	defer second.Stop()
 	require.NoError(t, first.Cleanup())
-	require.Never(t, func() bool { return original.Stats().Workers + second.Stats().Workers > 2 }, 200*time.Millisecond, time.Millisecond, "failed provisional cleanup cannot activate another pool alongside the current pool")
+	require.Never(t, func() bool { return original.Stats().Workers+second.Stats().Workers > 2 }, 200*time.Millisecond, time.Millisecond, "failed provisional cleanup cannot activate another pool alongside the current pool")
 }

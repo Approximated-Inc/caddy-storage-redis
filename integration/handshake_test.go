@@ -1,9 +1,8 @@
 package integration
 
 import (
-	"bytes"
 	"bufio"
-	"runtime"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -21,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,11 +41,11 @@ const testEncryptionKey = "integration-test-only-key-32-byte"
 
 type handshakeMarker struct{}
 type event struct {
-	Kind      string                          `json:"kind"`
-	Candidate *storageredis.MismatchCandidate `json:"candidate,omitempty"`
-	Key       string                          `json:"key,omitempty"`
-	Stats *storageredis.CertificateReporterStats `json:"stats,omitempty"`
-	Handshake bool                            `json:"handshake,omitempty"`
+	Kind      string                                 `json:"kind"`
+	Candidate *storageredis.MismatchCandidate        `json:"candidate,omitempty"`
+	Key       string                                 `json:"key,omitempty"`
+	Stats     *storageredis.CertificateReporterStats `json:"stats,omitempty"`
+	Handshake bool                                   `json:"handshake,omitempty"`
 }
 
 var eventMu sync.Mutex
@@ -148,8 +148,12 @@ func TestCaddyProcess(t *testing.T) {
 				currentReporter = previous
 			}
 		}
-		if currentReporter != nil { response.Stats = currentReporter.Stats() }
-		if previous != nil { response.Previous = previous.Stats() }
+		if currentReporter != nil {
+			response.Stats = currentReporter.Stats()
+		}
+		if previous != nil {
+			response.Previous = previous.Stats()
+		}
 		response.Goroutines = runtime.NumGoroutine()
 		encoded, err := json.Marshal(response)
 		require.NoError(t, err)
@@ -299,11 +303,11 @@ func (f *fixture) assertMismatch(t *testing.T) {
 
 type node struct {
 	address, events, logs string
-	configPath string
-	config map[string]any
-	input io.WriteCloser
-	sequence int
-	testRoots []byte
+	configPath            string
+	config                map[string]any
+	input                 io.WriteCloser
+	sequence              int
+	testRoots             []byte
 }
 
 func (f *fixture) startNode(t *testing.T) *node { return f.startNodeConfigured(t, nil) }

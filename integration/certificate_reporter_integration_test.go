@@ -1,8 +1,8 @@
 package integration
 
 import (
-	"encoding/base64"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,21 +24,26 @@ import (
 var currentReporter *storageredis.CertificateReporter
 
 type reporterMonitor struct {
-	Events string `json:"events"`
-	FailStart bool `json:"fail_start"`
-	reporter *storageredis.CertificateReporter
+	Events    string `json:"events"`
+	FailStart bool   `json:"fail_start"`
+	reporter  *storageredis.CertificateReporter
 }
+
 func (reporterMonitor) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{ID: "test_reporter_monitor", New: func() caddy.Module { return new(reporterMonitor) }}
 }
 func (m *reporterMonitor) Provision(ctx caddy.Context) error {
 	app, err := ctx.AppIfConfigured("apx_certificate_health")
-	if err == nil { m.reporter, _ = app.(*storageredis.CertificateReporter) }
+	if err == nil {
+		m.reporter, _ = app.(*storageredis.CertificateReporter)
+	}
 	currentReporter = m.reporter
 	return nil
 }
 func (m *reporterMonitor) Start() error {
-	if m.FailStart { return errors.New("test-only failed Start") }
+	if m.FailStart {
+		return errors.New("test-only failed Start")
+	}
 	return nil
 }
 func (m *reporterMonitor) Stop() error {
@@ -50,12 +55,15 @@ func (m *reporterMonitor) Stop() error {
 }
 func init() { caddy.RegisterModule(reporterMonitor{}) }
 
-type childCommand struct { Config json.RawMessage `json:"config,omitempty"` }
-type childResponse struct {
-	Error string
-	Stats, Previous storageredis.CertificateReporterStats
-	Goroutines int
+type childCommand struct {
+	Config json.RawMessage `json:"config,omitempty"`
 }
+type childResponse struct {
+	Error           string
+	Stats, Previous storageredis.CertificateReporterStats
+	Goroutines      int
+}
+
 func (n *node) command(t *testing.T, config map[string]any) childResponse {
 	t.Helper()
 	n.sequence++
@@ -86,7 +94,7 @@ func (f *fixture) startReporterNode(t *testing.T, endpoint *httptest.Server) *no
 	return f.startNodeConfigured(t, func(config map[string]any, n *node) {
 		n.testRoots = append(append([]byte{}, f.rootPEM...), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: endpoint.Certificate().Raw})...)
 		apps := config["apps"].(map[string]any)
-		apps["apx_certificate_health"] = map[string]any{"endpoint": endpoint.URL+"/api/internal/certificate-health/events", "proxy_server_id": 42, "machine_id": "{env.FLY_MACHINE_ID}", "token": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "address": n.address}
+		apps["apx_certificate_health"] = map[string]any{"endpoint": endpoint.URL + "/api/internal/certificate-health/events", "proxy_server_id": 42, "machine_id": "{env.FLY_MACHINE_ID}", "token": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "address": n.address}
 		apps["test_reporter_monitor"] = map[string]any{"events": n.events}
 		server := apps["http"].(map[string]any)["servers"].(map[string]any)["fixture"].(map[string]any)
 		server["listener_wrappers"] = []any{map[string]any{"wrapper": "proxy_protocol", "timeout": "5s", "fallback_policy": "use"}, map[string]any{"wrapper": "tls"}}
@@ -108,18 +116,22 @@ func TestCertificateReporterRepeatedReload(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&event))
 		mu.Lock()
 		received = append(received, event)
-		if expires == "" { expires = time.Now().Add(64*time.Second).UTC().Format(time.RFC3339) }
+		if expires == "" {
+			expires = time.Now().Add(64 * time.Second).UTC().Format(time.RFC3339)
+		}
 		expiry := expires
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(202)
-		json.NewEncoder(w).Encode(map[string]any{"report_id": "12345678-1234-4234-8234-123456789abc", "verification_nonce": base64.RawURLEncoding.EncodeToString(make([]byte,32)), "check_after_seconds": 30, "expires_at": expiry})
+		json.NewEncoder(w).Encode(map[string]any{"report_id": "12345678-1234-4234-8234-123456789abc", "verification_nonce": base64.RawURLEncoding.EncodeToString(make([]byte, 32)), "check_after_seconds": 30, "expires_at": expiry})
 	}))
 	defer server.Close()
 	n := f.startReporterNode(t, server)
 	baseline := n.command(t, nil)
 	conn, err := f.connect(n)
-	if conn != nil { conn.Close() }
+	if conn != nil {
+		conn.Close()
+	}
 	require.Error(t, err)
 	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(received) == 1 }, 5*time.Second, 10*time.Millisecond, "%s", n.log(t))
 	require.Eventually(t, func() bool { return n.command(t, nil).Stats.Accepted == 1 }, time.Second, 10*time.Millisecond)
@@ -137,9 +149,12 @@ func TestCertificateReporterRepeatedReload(t *testing.T) {
 		health := apps["apx_certificate_health"].(map[string]any)
 		health["token"] = base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32)))
 		switch failure {
-		case "provision": health["address"] = "outside.example:443"
-		case "start": apps["test_reporter_monitor"].(map[string]any)["fail_start"] = true
-		case "finish": config["admin"].(map[string]any)["remote"] = map[string]any{"listen": "127.0.0.1:invalid-port"}
+		case "provision":
+			health["address"] = "outside.example:443"
+		case "start":
+			apps["test_reporter_monitor"].(map[string]any)["fail_start"] = true
+		case "finish":
+			config["admin"].(map[string]any)["remote"] = map[string]any{"listen": "127.0.0.1:invalid-port"}
 		}
 		response := n.command(t, config)
 		require.NotEmpty(t, response.Error)
@@ -165,7 +180,9 @@ func TestCertificateReporterRepeatedReload(t *testing.T) {
 	require.Equal(t, "verification", next["kind"])
 	require.Equal(t, "valid", next["tls_result"])
 	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(f.leaf.Raw)), next["served_leaf_sha256"])
-	for _, key := range []string{"leaf_sha256", "cert_spki_sha256", "key_spki_sha256"} { require.Nil(t, next[key]) }
+	for _, key := range []string{"leaf_sha256", "cert_spki_sha256", "key_spki_sha256"} {
+		require.Nil(t, next[key])
+	}
 	//202 acknowledges evidence, not completed repair: a later fresh success is
 	// still emitted with the same nonce, allowing strictly post-attempt proof.
 	require.Equal(t, 1, n.command(t, nil).Stats.Active)
@@ -194,17 +211,33 @@ func TestCertificateReporterReloadCancelsBlockedDelivery(t *testing.T) {
 			f.seed(t, true)
 			entered := make(chan struct{}, 2)
 			release := make(chan struct{})
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { entered <- struct{}{}; select { case <-r.Context().Done(): case <-release: } }))
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				entered <- struct{}{}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
 			defer server.Close()
 			defer close(release)
 			n := f.startReporterNode(t, server)
 			conn, err := f.connect(n)
-			if conn != nil { conn.Close() }
+			if conn != nil {
+				conn.Close()
+			}
 			require.Error(t, err)
-			select { case <-entered: case <-time.After(5*time.Second): t.Fatal("no reporter request") }
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no reporter request")
+			}
 			config := cloneConfig(t, n.config)
 			apps := config["apps"].(map[string]any)
-			if mode == "disable" { delete(apps, "apx_certificate_health") } else { apps["apx_certificate_health"].(map[string]any)["token"] = base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32))) }
+			if mode == "disable" {
+				delete(apps, "apx_certificate_health")
+			} else {
+				apps["apx_certificate_health"].(map[string]any)["token"] = base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat("x", 32)))
+			}
 			start := time.Now()
 			response := n.command(t, config)
 			require.Empty(t, response.Error)
@@ -212,8 +245,16 @@ func TestCertificateReporterReloadCancelsBlockedDelivery(t *testing.T) {
 			require.Zero(t, response.Previous.Active)
 			require.Zero(t, response.Previous.Workers)
 			require.Zero(t, response.Previous.Dedupe)
-			for _, event := range n.observations(t) { if event.Kind == "reporter_monitor_stop" { require.Zero(t, event.Stats.Workers, "cancel before any old app Stop/drain") } }
-			if mode == "changed-token" { require.Equal(t, 2, response.Stats.Workers) } else { require.Zero(t, response.Stats.Workers) }
+			for _, event := range n.observations(t) {
+				if event.Kind == "reporter_monitor_stop" {
+					require.Zero(t, event.Stats.Workers, "cancel before any old app Stop/drain")
+				}
+			}
+			if mode == "changed-token" {
+				require.Equal(t, 2, response.Stats.Workers)
+			} else {
+				require.Zero(t, response.Stats.Workers)
+			}
 		})
 	}
 }

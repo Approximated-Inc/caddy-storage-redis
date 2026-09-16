@@ -2,10 +2,10 @@ package storageredis
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/sha256"
-	"encoding/hex"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"net"
 	"strconv"
@@ -25,15 +25,15 @@ type LocalCertificateProbe struct {
 type CertificateTLSResult string
 
 const (
-	TLSAlert CertificateTLSResult = "tls_alert"
+	TLSAlert           CertificateTLSResult = "tls_alert"
 	CertificateInvalid CertificateTLSResult = "certificate_invalid"
-	TLSValid CertificateTLSResult = "valid"
+	TLSValid           CertificateTLSResult = "valid"
 )
 
 // An empty Result is inconclusive and must never be sent as failure evidence.
 type CertificateProbeResult struct {
-	Result CertificateTLSResult
-	CheckedAt time.Time
+	Result           CertificateTLSResult
+	CheckedAt        time.Time
 	ServedLeafSHA256 string
 }
 
@@ -44,7 +44,9 @@ func (p LocalCertificateProbe) Confirm(ctx context.Context, hostname string) boo
 
 func validProbeAddress(address string) bool {
 	host, port, err := net.SplitHostPort(address)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	ip := net.ParseIP(host)
 	n, err := strconv.Atoi(port)
 	return ip != nil && ip.IsLoopback() && err == nil && n > 0 && n <= 65535
@@ -69,7 +71,9 @@ func (p LocalCertificateProbe) Check(ctx context.Context, hostname string) Certi
 		}
 		return result
 	}
-	if ctx.Err() != nil { return result }
+	if ctx.Err() != nil {
+		return result
+	}
 	var verification *tls.CertificateVerificationError
 	if errors.As(err, &verification) {
 		result.Result = CertificateInvalid
@@ -77,7 +81,9 @@ func (p LocalCertificateProbe) Check(ctx context.Context, hostname string) Certi
 	}
 	// The TCP TLS path wraps its unexported alert in a typed remote operation.
 	var remote *net.OpError
-	if errors.As(err, &remote) && remote.Op == "remote error" { result.Result = TLSAlert }
+	if errors.As(err, &remote) && remote.Op == "remote error" {
+		result.Result = TLSAlert
+	}
 	return result
 }
 
