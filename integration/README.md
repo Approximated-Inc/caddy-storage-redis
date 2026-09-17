@@ -97,9 +97,9 @@ Run `GOCACHE=/private/tmp/apx-cert-go-cache ./test-caddy-version.sh v2.11.3`
 and the same command with `v2.11.4`. This executes the production reporter and
 production handshake hook, including 20 actual Caddy reloads, failed replacement
 configs, cancellation of blocked HTTPS requests on disable/credential changes,
-and real nonce-bound verifications of the freshly served certificate at30 and60
-seconds (a202 success must keep the root scheduled until204 or expiry).
-The existing gated Task2 observer tests use a renamed test app/context adapter;
+and real nonce-bound verifications of the freshly served certificate at 30 and 60
+seconds (a 202 success must keep the root scheduled until 204 or expiry).
+The existing gated Task 2 observer tests use a renamed test app/context adapter;
 they retain their exact direct/L4 recursive storage-read measurements.
 
 The matrix script copies the exact version-resolved Caddy source into disposable
