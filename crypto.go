@@ -18,6 +18,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -43,9 +44,32 @@ func (rs *RedisStorage) encrypt(bytes []byte) ([]byte, error) {
 	return gcm.Seal(nonce, nonce, bytes, nil), nil
 }
 
+// errDecryptionFailure marks a value that does not authenticate with a key,
+// which is the only failure worth retrying with another key.
+var errDecryptionFailure = errors.New("Decryption failure")
+
+// decrypt opens bytes with EncryptionKey, then with each DecryptionKeys entry
+// in order. When no key authenticates the value, the EncryptionKey error is
+// returned.
 func (rs *RedisStorage) decrypt(bytes []byte) ([]byte, error) {
 
-	block, err := aes.NewCipher([]byte(rs.EncryptionKey))
+	out, err := decryptWithKey(rs.EncryptionKey, bytes)
+	if err == nil || !errors.Is(err, errDecryptionFailure) {
+		return out, err
+	}
+
+	for _, key := range rs.DecryptionKeys {
+		if fallback, fallbackErr := decryptWithKey(key, bytes); fallbackErr == nil {
+			return fallback, nil
+		}
+	}
+
+	return nil, err
+}
+
+func decryptWithKey(key string, bytes []byte) ([]byte, error) {
+
+	block, err := aes.NewCipher([]byte(key))
 	if err != nil {
 		return nil, fmt.Errorf("Unable to create AES cipher: %v", err)
 	}
@@ -61,7 +85,7 @@ func (rs *RedisStorage) decrypt(bytes []byte) ([]byte, error) {
 
 	out, err := gcm.Open(nil, bytes[:gcm.NonceSize()], bytes[gcm.NonceSize():], nil)
 	if err != nil {
-		return nil, fmt.Errorf("Decryption failure: %v", err)
+		return nil, fmt.Errorf("%w: %v", errDecryptionFailure, err)
 	}
 
 	return out, nil

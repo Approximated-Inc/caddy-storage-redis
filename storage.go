@@ -100,6 +100,18 @@ type RedisStorage struct {
 	// EncryptionKey A key string used to symmetrically encrypt and decrypt data stored in Redis.
 	// The key must be exactly 32 characters, longer values will be truncated. Default: "" (No encryption)
 	EncryptionKey string `json:"encryption_key"`
+	// DecryptionKeys Additional keys tried, in order, when a value does not
+	// authenticate with EncryptionKey. Writes always use EncryptionKey, so a
+	// key can be changed without leaving any reader unable to load a value.
+	// Each entry supports Caddy placeholders, must expand to at least 32
+	// bytes (longer values are truncated to 32), and requires EncryptionKey.
+	// Default: none.
+	DecryptionKeys []string `json:"decryption_keys,omitempty"`
+	// ClientName Sets the connection name (CLIENT SETNAME) on every
+	// connection, for attribution in CLIENT LIST. Supports Caddy placeholders,
+	// for example "{env.FLY_APP_NAME}/{env.FLY_MACHINE_ID}". The server needs
+	// to allow CLIENT SETNAME for the user. Default: "" (no name is set).
+	ClientName string `json:"client_name,omitempty"`
 	// Compression Specifies the compression algorithm to use when storing values in Redis.
 	// Valid values are "flate", "zlib", or "false" (no compression). Default: "" (no compression)
 	// Supports Caddy placeholders (e.g. {env.COMPRESSION}).
@@ -269,6 +281,7 @@ func (rs RedisStorage) buildClient(ctx context.Context) (redis.UniversalClient, 
 		Username:   rs.Username,
 		Password:   rs.Password,
 		DB:         dbInt,
+		ClientName: rs.ClientName,
 	}
 
 	// Configure timeout values if defined
@@ -953,15 +966,26 @@ func (rs RedisStorage) splitDirectoryKey(key string, baseIsDir bool) (string, st
 }
 
 // String returns a JSON representation of the configuration with sensitive fields redacted.
-// The value receiver is intentional: Password and EncryptionKey are mutated on the copy
-// so the original struct is never modified.
+// The value receiver is intentional: Password, SentinelPassword and EncryptionKey are mutated on the copy
+// so the original struct is never modified. DecryptionKeys gets a new slice because the
+// copy shares the original's backing array.
 func (rs RedisStorage) String() string {
 	redacted := `REDACTED`
 	if rs.Password != "" {
 		rs.Password = redacted
 	}
+	if rs.SentinelPassword != "" {
+		rs.SentinelPassword = redacted
+	}
 	if rs.EncryptionKey != "" {
 		rs.EncryptionKey = redacted
+	}
+	if len(rs.DecryptionKeys) > 0 {
+		keys := make([]string, len(rs.DecryptionKeys))
+		for i := range keys {
+			keys[i] = redacted
+		}
+		rs.DecryptionKeys = keys
 	}
 	strVal, _ := json.Marshal(rs)
 	return string(strVal)
