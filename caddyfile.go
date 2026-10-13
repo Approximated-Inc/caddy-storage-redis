@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -126,6 +127,10 @@ func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "encryption_key", "aes_key":
 				rs.EncryptionKey = configVal[0]
+			case "decryption_keys":
+				rs.DecryptionKeys = configVal
+			case "client_name":
+				rs.ClientName = configVal[0]
 			case "compression":
 				// Accept legacy bool values (true/false, 1/0, t/f, etc.) for backwards
 				// compatibility, mapping true → "flate". If ParseBool fails, expect one
@@ -262,6 +267,15 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 		}
 	}
 
+	if err := rs.finalizeDecryptionKeys(repl); err != nil {
+		return err
+	}
+
+	rs.ClientName = repl.ReplaceAll(rs.ClientName, "")
+	if err := validateClientName(rs.ClientName); err != nil {
+		return err
+	}
+
 	rs.TlsServerCertsPEM = repl.ReplaceAll(rs.TlsServerCertsPEM, "")
 	rs.TlsServerCertsPath = repl.ReplaceAll(rs.TlsServerCertsPath, "")
 
@@ -315,6 +329,48 @@ func (rs *RedisStorage) finalizeConfiguration(ctx context.Context) error {
 	}
 
 	return rs.initRedisClient(ctx)
+}
+
+// finalizeDecryptionKeys expands placeholders in DecryptionKeys and applies
+// the same length rules as encryption_key. An entry that expands to fewer than
+// 32 bytes (including an unset placeholder) fails provisioning, so a missing
+// secret never silently drops a key. Entries equal to EncryptionKey or to an
+// earlier entry are dropped, since trying them again cannot succeed.
+func (rs *RedisStorage) finalizeDecryptionKeys(repl *caddy.Replacer) error {
+	if len(rs.DecryptionKeys) == 0 {
+		return nil
+	}
+	if rs.EncryptionKey == "" {
+		return fmt.Errorf("'decryption_keys' requires 'encryption_key'")
+	}
+
+	keys := make([]string, 0, len(rs.DecryptionKeys))
+	for idx, key := range rs.DecryptionKeys {
+		key = repl.ReplaceAll(key, "")
+		if len(key) < 32 {
+			return fmt.Errorf("invalid length for 'decryption_keys' entry %d, must contain at least 32 bytes", idx)
+		}
+		key = key[:32]
+		if key == rs.EncryptionKey || slices.Contains(keys, key) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	rs.DecryptionKeys = keys
+
+	return nil
+}
+
+// validateClientName applies the server's rule for connection names (no
+// spaces, newlines or other characters outside '!' to '~'), so a bad name
+// fails provisioning with a clear error instead of a refused handshake.
+func validateClientName(name string) error {
+	for i := 0; i < len(name); i++ {
+		if name[i] < '!' || name[i] > '~' {
+			return fmt.Errorf("invalid 'client_name': only printable ASCII without spaces is allowed")
+		}
+	}
+	return nil
 }
 
 func normalizeKeyPrefix(prefix string) (string, error) {
