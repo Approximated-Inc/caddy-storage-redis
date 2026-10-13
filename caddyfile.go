@@ -62,6 +62,15 @@ func (rs *RedisStorage) CertMagicStorage() (certmagic.Storage, error) {
 	return rs, nil
 }
 
+// multiValueKeys are the Caddyfile keys that take a list, so several values
+// may follow the key on one line as well as in a block.
+var multiValueKeys = map[string]bool{
+	"address":         true,
+	"host":            true,
+	"port":            true,
+	"decryption_keys": true,
+}
+
 func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 	for d.Next() {
@@ -81,8 +90,15 @@ func (rs *RedisStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			var configVal []string
 
 			if d.NextArg() {
-				// configuration item with single parameter
+				// configuration item with parameters on the same line
 				configVal = append(configVal, d.Val())
+				if extra := d.RemainingArgs(); len(extra) > 0 {
+					// Never echo the values: they may be secrets.
+					if !multiValueKeys[configKey] {
+						return d.Errf("too many values on one line for configuration key '%s'", configKey)
+					}
+					configVal = append(configVal, extra...)
+				}
 			} else {
 				// configuration item with nested parameter list
 				for nesting := d.Nesting(); d.NextBlock(nesting); {

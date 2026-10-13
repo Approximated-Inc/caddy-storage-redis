@@ -53,7 +53,6 @@ Enable Redis storage for Caddy by specifying the module configuration in the Cad
         timeout        5
         key_prefix     "caddy" // should not contain any leading or trailing '/' characters nor '.' or '..' path segments
         encryption_key ""      // default no encryption; enable by specifying a secret key containing 32 characters (longer keys will be truncated)
-        decryption_keys ""     // optional: additional keys tried when reading, see "Changing the encryption key"
         client_name    ""      // optional: connection name shown in CLIENT LIST
         compression    false   // compression algorithm: 'flate' (raw DEFLATE), 'zlib', or 'false' (no compression, the default). Legacy boolean 'true' maps to 'flate'
         tls_enabled    false
@@ -252,7 +251,7 @@ If you prefer not to put certificates in your Caddyfile, you can also put the se
 {
     storage redis {
         encryption_key  "{env.NEW_KEY}"
-        decryption_keys "{env.OLD_KEY}"   // or a block with one key per line
+        decryption_keys "{env.OLD_KEY}"   # several keys: on one line, or a block with one key per line
     }
 }
 ```
@@ -270,7 +269,10 @@ When several servers share the storage and pick up a config change at different 
 
 ### Access control (ACL) rules
 
-With a Redis or Valkey ACL user per key prefix, the module needs only these commands:
+With a Redis 7.2+ or Valkey ACL user per key prefix, the module needs only the commands below. This list holds for `client_type` simple (one `address`) with a single-segment `key_prefix` (no `/`):
+
+- Cluster and failover clients send more commands (cluster topology and Sentinel commands, for example).
+- With a multi-segment prefix such as `a/b`, `Store` also adds entries to the directory index of every parent (`ZADD a`), which falls outside `~a/b ~a/b/*`.
 
 | Commands | Used by |
 |---|---|
@@ -281,13 +283,20 @@ With a Redis or Valkey ACL user per key prefix, the module needs only these comm
 | `get set del exists zadd zrem zrange` | storage operations |
 | `evalsha eval getrange pexpire` | locks (`set get del` are also called inside the lock scripts) |
 
-The key patterns must cover the bare prefix (the root directory index) and everything below it, for example `~caddy_prefix ~caddy_prefix/*`. A single `~caddy_prefix*` would also match other prefixes that start the same way. `caddy redis repair` additionally needs `scan` and `type`.
+The key patterns must cover the bare prefix (the root directory index) and everything below it, for example `~caddy_prefix ~caddy_prefix/*`. A single `~caddy_prefix*` would also match other prefixes that start the same way.
 
 ```
-ACL SETUSER caddy_node on >password resetchannels ~caddy_prefix ~caddy_prefix/* -@all \
+ACL SETUSER caddy_node reset on >password resetchannels ~caddy_prefix ~caddy_prefix/* -@all \
   +select +client|setname +client|setinfo +ping +get +set +del +exists +zadd +zrem +zrange \
   +evalsha +eval +getrange +pexpire
 ```
+
+Notes:
+
+- `reset` first, so rules left from an earlier `ACL SETUSER` for the same user do not survive.
+- `CLIENT SETINFO` was added in Redis 7.2. On older servers `+client|setinfo` is an unknown subcommand and the whole `ACL SETUSER` fails, so leave it out there.
+- `caddy redis repair` also needs `scan` and `type`. `SCAN` returns every key name in the database, whatever the key patterns allow, so never grant it to a user that shares the server with other tenants. Run repair as a separate administrative user.
+- go-redis also sends `CLIENT MAINT_NOTIFICATIONS` once per client. Valkey and older Redis do not know that subcommand, so each client adds one `errorstat_ERR` to `INFO errorstats`. This is not an ACL denial and never reaches `ACL LOG`, and it cannot be granted in advance.
 
 `valkey_acl_integration_test.go` checks this list against a Docker Valkey 9.1 server (`APX_VALKEY_ACL_INTEGRATION=1 go test -run TestValkeyACL -v .`).
 

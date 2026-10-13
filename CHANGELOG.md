@@ -5,6 +5,11 @@
 - **`decryption_keys`.** An ordered list of additional keys that are tried when a value does not authenticate with `encryption_key`. Writes always use `encryption_key`, so a key can be changed in phases without any server losing the ability to read what the others write. Each entry supports placeholders (`{env.*}`, `{file.*}`), must expand to at least 32 bytes (longer values are truncated), and requires `encryption_key`. An entry that expands to less, including an unset placeholder, fails provisioning.
 - **`client_name`.** Sets the connection name (`CLIENT SETNAME`) on every connection, with placeholder support, for attribution in `CLIENT LIST`. Names outside printable ASCII or with spaces are rejected at provisioning.
 
+### Security fixes
+
+- **`String()` now redacts `sentinel_password`**, as it already did `password` and `encryption_key`.
+- **Caddyfile values are no longer echoed in parse errors when a line has extra values.** Previously `password "a" "b"` failed with an error that quoted `b` as an unknown configuration key. Single-value keys now fail with an error that names only the key. List keys (`address`, `host`, `port`, `decryption_keys`) accept several values on one line.
+
 ### Improvements
 
 - Configurations without the new fields behave as before: the same commands, the same stored bytes, and the same `String()` output.

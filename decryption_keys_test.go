@@ -378,3 +378,52 @@ func TestString_RedactsDecryptionKeysWithoutMutatingThem(t *testing.T) {
 	assert.Equal(t, "apx-dev-ps-89/d8d9e1", decoded.ClientName)
 	assert.Equal(t, []string{clusterTestKey, otherTestKey}, rs.DecryptionKeys)
 }
+
+func TestUnmarshalCaddyfile_ExtraArgsNeverEchoSecrets(t *testing.T) {
+	t.Run("decryption_keys accepts several keys on one line", func(t *testing.T) {
+		d := caddyfile.NewTestDispenser(`redis {
+			decryption_keys "first-secret-key-value" "second-secret-key-value"
+		}`)
+		rs := New()
+		require.NoError(t, rs.UnmarshalCaddyfile(d))
+		assert.Equal(t, []string{"first-secret-key-value", "second-secret-key-value"}, rs.DecryptionKeys)
+	})
+
+	for _, key := range []string{"encryption_key", "aes_key", "password", "sentinel_password", "username", "client_name"} {
+		t.Run(key+" rejects extra values without echoing them", func(t *testing.T) {
+			d := caddyfile.NewTestDispenser(`redis {
+				` + key + ` "first-secret-value" "second-secret-value"
+			}`)
+			rs := New()
+			err := rs.UnmarshalCaddyfile(d)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "too many values on one line for configuration key '"+key+"'")
+			assert.NotContains(t, err.Error(), "first-secret-value")
+			assert.NotContains(t, err.Error(), "second-secret-value")
+		})
+	}
+
+	t.Run("block form of a single-value key is unchanged", func(t *testing.T) {
+		d := caddyfile.NewTestDispenser(`redis {
+			password {
+				"block-secret"
+			}
+		}`)
+		rs := New()
+		require.NoError(t, rs.UnmarshalCaddyfile(d))
+		assert.Equal(t, "block-secret", rs.Password)
+	})
+}
+
+func TestString_RedactsSentinelPassword(t *testing.T) {
+	rs := New()
+	rs.SentinelPassword = "sentinel-secret"
+
+	out := rs.String()
+	assert.NotContains(t, out, "sentinel-secret")
+
+	var decoded RedisStorage
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	assert.Equal(t, "REDACTED", decoded.SentinelPassword)
+	assert.Equal(t, "sentinel-secret", rs.SentinelPassword)
+}
