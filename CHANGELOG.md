@@ -1,3 +1,15 @@
+# Unreleased (Approximated fork)
+
+### New features
+
+- **`decryption_keys`.** An ordered list of additional keys that are tried when a value does not authenticate with `encryption_key`. Writes always use `encryption_key`, so a key can be changed in phases without any server losing the ability to read what the others write. Each entry supports placeholders (`{env.*}`, `{file.*}`), must expand to at least 32 bytes (longer values are truncated), and requires `encryption_key`. An entry that expands to less, including an unset placeholder, fails provisioning.
+- **`client_name`.** Sets the connection name (`CLIENT SETNAME`) on every connection, with placeholder support, for attribution in `CLIENT LIST`. Names outside printable ASCII or with spaces are rejected at provisioning.
+
+### Improvements
+
+- Configurations without the new fields behave as before: the same commands, the same stored bytes, and the same `String()` output.
+- Documented the exact command list for an ACL user, and added an opt-in Docker Valkey 9.1 ACL integration test (`APX_VALKEY_ACL_INTEGRATION=1`).
+
 # v1.8.0 (2026-03-31)
 
 ### New features

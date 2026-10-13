@@ -53,6 +53,8 @@ Enable Redis storage for Caddy by specifying the module configuration in the Cad
         timeout        5
         key_prefix     "caddy" // should not contain any leading or trailing '/' characters nor '.' or '..' path segments
         encryption_key ""      // default no encryption; enable by specifying a secret key containing 32 characters (longer keys will be truncated)
+        decryption_keys ""     // optional: additional keys tried when reading, see "Changing the encryption key"
+        client_name    ""      // optional: connection name shown in CLIENT LIST
         compression    false   // compression algorithm: 'flate' (raw DEFLATE), 'zlib', or 'false' (no compression, the default). Legacy boolean 'true' maps to 'flate'
         tls_enabled    false
         tls_insecure   false
@@ -241,6 +243,53 @@ You can also use the `tls_server_certs_pem` option to provide one or more PEM en
 }
 ```
 If you prefer not to put certificates in your Caddyfile, you can also put the series of PEM certificates into a file and use `tls_server_certs_path` to point Caddy at it.
+
+### Changing the encryption key
+
+`encryption_key` encrypts every value written. `decryption_keys` is an ordered list of additional keys that are tried, in order, when a value does not authenticate with `encryption_key`. Writes always use `encryption_key`. Each entry supports placeholders and must expand to at least 32 bytes (longer values are truncated to 32, as for `encryption_key`). An entry that expands to less, including an unset `{env.*}` placeholder, fails provisioning. `decryption_keys` requires `encryption_key`.
+
+```
+{
+    storage redis {
+        encryption_key  "{env.NEW_KEY}"
+        decryption_keys "{env.OLD_KEY}"   // or a block with one key per line
+    }
+}
+```
+
+When several servers share the storage and pick up a config change at different times, change a key in phases, and finish each phase on every server before starting the next:
+
+1. `encryption_key OLD`, `decryption_keys NEW`: still writes with the old key, reads both.
+2. `encryption_key NEW`, `decryption_keys OLD`: writes with the new key, reads both.
+3. Re-encrypt the remaining old-key values (outside this module).
+4. `encryption_key NEW` only.
+
+### Connection names
+
+`client_name` sets the connection name (`CLIENT SETNAME`) on every connection, so `CLIENT LIST` shows which server each connection belongs to. It supports placeholders, for example `"{env.FLY_APP_NAME}/{env.FLY_MACHINE_ID}"`, and must be printable ASCII without spaces. With ACLs the user needs `+client|setname`, or every connection fails.
+
+### Access control (ACL) rules
+
+With a Redis or Valkey ACL user per key prefix, the module needs only these commands:
+
+| Commands | Used by |
+|---|---|
+| `select` | connection handshake when `db` is not 0 |
+| `client\|setname` | connection handshake when `client_name` is set |
+| `client\|setinfo` | connection handshake (a denial is ignored, but is written to `ACL LOG`) |
+| `ping` | provisioning |
+| `get set del exists zadd zrem zrange` | storage operations |
+| `evalsha eval getrange pexpire` | locks (`set get del` are also called inside the lock scripts) |
+
+The key patterns must cover the bare prefix (the root directory index) and everything below it, for example `~caddy_prefix ~caddy_prefix/*`. A single `~caddy_prefix*` would also match other prefixes that start the same way. `caddy redis repair` additionally needs `scan` and `type`.
+
+```
+ACL SETUSER caddy_node on >password resetchannels ~caddy_prefix ~caddy_prefix/* -@all \
+  +select +client|setname +client|setinfo +ping +get +set +del +exists +zadd +zrem +zrange \
+  +evalsha +eval +getrange +pexpire
+```
+
+`valkey_acl_integration_test.go` checks this list against a Docker Valkey 9.1 server (`APX_VALKEY_ACL_INTEGRATION=1 go test -run TestValkeyACL -v .`).
 
 ## Maintenance
 
